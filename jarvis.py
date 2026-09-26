@@ -6,7 +6,7 @@ import glob
 import shutil
 import wave
 import signal
-import select
+import socket
 import threading
 import subprocess
 import urllib.parse
@@ -20,7 +20,7 @@ from faster_whisper import WhisperModel
 import ollama
 
 # ==========================================
-# 0. SILENCE ALSA / JACK LOG SPAM
+# 0. SUPPRESS ALSA / BACKEND LOGS
 # ==========================================
 @contextlib.contextmanager
 def no_alsa_err():
@@ -41,7 +41,7 @@ def no_alsa_err():
             pass
 
 # ==========================================
-# 1. HARDWARE & AUDIO CONFIG
+# 1. HARDWARE & ENGINE CONFIG
 # ==========================================
 PIPER_MODEL = os.path.expanduser("~/jarvis_os/models/piper/en_US-lessac-medium.onnx")
 PIPER_CONFIG = os.path.expanduser("~/jarvis_os/models/piper/en_US-lessac-medium.onnx.json")
@@ -53,29 +53,47 @@ CHANNELS = 2
 CHUNK_SIZE = 2048
 
 IS_SPEAKING = False
-INTERRUPT_REQUESTED = False
 CURRENT_PROC = None
 PROC_LOCK = threading.Lock()
 
-PENDING_ACTION = None
+RECORDING_ACTIVE = False
+AUDIO_FRAMES = []
 
-print("[Initialization] Loading Whisper speech engine...")
+SOCKET_PATH = "/tmp/jarvis.sock"
+CONNECTED_CLIENTS = []
+CLIENT_LOCK = threading.Lock()
+
+print("[Init] Loading Whisper speech engine...")
 with no_alsa_err():
     stt_model = WhisperModel(WHISPER_SIZE, device="cpu", compute_type="int8")
 
 # ==========================================
-# 2. AUDIO DSP & INSTANT KEYBOARD CUTOFF
+# 2. STATUS BROADCASTER
+# ==========================================
+def emit_status(status_type: str, message: str):
+    payload = f"{status_type}|{message}\n".encode("utf-8")
+    with CLIENT_LOCK:
+        dead = []
+        for client in CONNECTED_CLIENTS:
+            try:
+                client.sendall(payload)
+            except Exception:
+                dead.append(client)
+        for d in dead:
+            if d in CONNECTED_CLIENTS:
+                CONNECTED_CLIENTS.remove(d)
+
+# ==========================================
+# 3. ROBUST AUDIO DSP & INSTANT SKIP
 # ==========================================
 def convert_to_16k_mono(raw_bytes: bytes) -> bytes:
-    """Downsamples native 48kHz stereo to 16kHz mono int16 cleanly."""
     audio = np.frombuffer(raw_bytes, dtype=np.int16)
     mono = audio.reshape(-1, 2).mean(axis=1).astype(np.int16)
     return mono[::3].tobytes()
 
 def stop_playback():
-    """Instantly kills whatever sentence is currently playing."""
-    global CURRENT_PROC, INTERRUPT_REQUESTED
-    INTERRUPT_REQUESTED = True
+    """Instantly kills Piper and audio playback."""
+    global CURRENT_PROC, IS_SPEAKING
     with PROC_LOCK:
         if CURRENT_PROC is not None:
             try:
@@ -83,35 +101,22 @@ def stop_playback():
             except Exception:
                 pass
             CURRENT_PROC = None
-
-def keyboard_skip_listener():
-    """Listens in background for Enter key press on terminal to immediately skip speaking."""
-    while True:
-        try:
-            rlist, _, _ = select.select([sys.stdin], [], [], 0.05)
-            if rlist:
-                sys.stdin.readline()
-                if IS_SPEAKING:
-                    print("\n[User Hit Enter] Skipping speech output...", flush=True)
-                    stop_playback()
-        except Exception:
-            pass
-
-threading.Thread(target=keyboard_skip_listener, daemon=True).start()
+    subprocess.run(["pkill", "-9", "-f", "aplay -r 22050"], capture_output=True)
+    IS_SPEAKING = False
+    emit_status("STATE", "STANDBY")
+    emit_status("LOG", "Speech skipped.")
 
 def play_single_sentence(sentence: str) -> bool:
-    """Plays a single sentence. Returns False if interrupted."""
-    global CURRENT_PROC, IS_SPEAKING, INTERRUPT_REQUESTED
-    if INTERRUPT_REQUESTED:
-        return False
-
+    global CURRENT_PROC, IS_SPEAKING
     clean = sentence.replace('"', '\\"').replace("'", "").replace("\n", " ").strip()
     if not clean:
         return True
 
     IS_SPEAKING = True
+    emit_status("STATE", "SPEAKING")
+    emit_status("LOG", f"Speaking: {clean}")
+
     piper_cmd = f'echo "{clean}" | piper --model {PIPER_MODEL} --config {PIPER_CONFIG} --output-raw | aplay -r 22050 -f S16_LE -t raw -q'
-    
     proc = subprocess.Popen(piper_cmd, shell=True, preexec_fn=os.setsid)
     with PROC_LOCK:
         CURRENT_PROC = proc
@@ -120,719 +125,550 @@ def play_single_sentence(sentence: str) -> bool:
     with PROC_LOCK:
         CURRENT_PROC = None
 
-    time.sleep(0.08)
+    time.sleep(0.06)
     IS_SPEAKING = False
-    return not INTERRUPT_REQUESTED
+    emit_status("STATE", "STANDBY")
+    return True
 
 # ==========================================
-# 3. ADVANCED SYSTEM & FILE OPS TOOLS
+# 4. ALL FUNCTION DEFINITIONS (ORDERED FIRST)
 # ==========================================
+def get_desktop_env():
+    env = os.environ.copy()
+    if "DISPLAY" not in env:
+        env["DISPLAY"] = ":0"
+    if "WAYLAND_DISPLAY" not in env:
+        for candidate in ["wayland-0", "wayland-1"]:
+            if os.path.exists(f"/run/user/{os.getuid()}/{candidate}"):
+                env["WAYLAND_DISPLAY"] = candidate
+                break
+    if "XDG_RUNTIME_DIR" not in env:
+        env["XDG_RUNTIME_DIR"] = f"/run/user/{os.getuid()}"
+    if "DBUS_SESSION_BUS_ADDRESS" not in env:
+        bus = f"/run/user/{os.getuid()}/bus"
+        if os.path.exists(bus):
+            env["DBUS_SESSION_BUS_ADDRESS"] = f"unix:path={bus}"
+    return env
+
 def resolve_system_path(raw_path: str) -> Path:
-    """Intelligently resolves paths, expanding ~ and matching common home directories."""
     cleaned = raw_path.strip().strip("'\"")
     expanded = Path(os.path.expanduser(cleaned))
-    
     if expanded.is_absolute() and expanded.exists():
         return expanded.resolve()
 
-    common_dirs = {
-        "downloads": Path.home() / "Downloads",
-        "documents": Path.home() / "Documents",
-        "desktop": Path.home() / "Desktop",
-        "pictures": Path.home() / "Pictures",
-        "videos": Path.home() / "Videos",
-        "music": Path.home() / "Music",
-        "home": Path.home()
+    common = {
+        "downloads": Path.home() / "Downloads", "documents": Path.home() / "Documents",
+        "desktop": Path.home() / "Desktop", "pictures": Path.home() / "Pictures",
+        "screenshots": Path.home() / "Pictures/Screenshots",
+        "videos": Path.home() / "Videos", "music": Path.home() / "Music", "home": Path.home()
     }
-    
     low = cleaned.lower().rstrip("/\\")
-    if low in common_dirs:
-        return common_dirs[low]
+    if low in common:
+        return common[low]
 
-    for name, p in common_dirs.items():
+    for name, p in common.items():
         if low.startswith(name + "/"):
-            remainder = cleaned[len(name) + 1:]
-            return (p / remainder).resolve()
+            return (p / cleaned[len(name) + 1:]).resolve()
 
-    candidate = Path.home() / cleaned.lstrip("/")
-    if candidate.exists():
-        return candidate.resolve()
-
-    for p in common_dirs.values():
-        sub_candidate = p / cleaned.split("/")[-1]
-        if sub_candidate.exists():
-            return sub_candidate.resolve()
+    for base in [Path.home() / "Pictures", Path.home() / "Documents", Path.home() / "Downloads", Path.home() / "Desktop"]:
+        candidate = base / cleaned
+        if candidate.exists():
+            return candidate.resolve()
+        for sub in base.iterdir():
+            if sub.is_dir() and sub.name.lower() == low:
+                return sub.resolve()
 
     return expanded.resolve()
 
-def open_folder(folder_name: str):
-    """Opens a system directory or folder in the native file manager (Nautilus)."""
-    p = resolve_system_path(folder_name)
-    if p.exists() and p.is_dir():
-        subprocess.Popen(["xdg-open", str(p)])
-        return f"Opened {p.name} folder."
-    elif (Path.home() / folder_name.strip()).exists():
-        target = Path.home() / folder_name.strip()
-        subprocess.Popen(["xdg-open", str(target)])
-        return f"Opened {target.name} folder."
-    return f"Folder '{folder_name}' not found."
-
-def select_item_in_file_manager(item_name: str):
-    """Navigates to and opens a folder or file inside the currently active Nautilus/Files window using type-ahead search."""
-    if not shutil.which("xdotool"):
-        return "xdotool is not installed. Please run: sudo apt install xdotool"
-
-    clean_item = item_name.strip().strip("'\"")
-    clean_item = re.sub(r'\s+(folder|directory|file)$', '', clean_item, flags=re.I).strip()
-
-    script = f"""
-    xdotool key --clearmodifiers Escape
-    sleep 0.15
-    xdotool type --delay 40 "{clean_item}"
-    sleep 0.35
-    xdotool key Return
-    """
-    subprocess.run(script, shell=True)
-    return f"Opened '{clean_item}' in the active window."
-
-def move_file_or_folder(source: str, destination: str, filename: str = None):
-    """Moves files or directories reliably across user directories."""
-    try:
-        src_path = resolve_system_path(source)
-        dest_path = resolve_system_path(destination)
-
-        if filename:
-            target_file = src_path / filename if src_path.is_dir() else src_path
-            if not target_file.exists():
-                for sub in [Path.home() / "Downloads", Path.home() / "Documents", Path.home() / "Desktop"]:
-                    if (sub / filename).exists():
-                        target_file = sub / filename
-                        break
-            src_path = target_file
-
-        if not src_path.exists():
-            return f"Source file or folder '{source}' not found."
-
-        dest_path.mkdir(parents=True, exist_ok=True)
-        final_dest = dest_path / src_path.name if dest_path.is_dir() else dest_path
-
-        shutil.move(str(src_path), str(final_dest))
-        return f"Moved {src_path.name} to {dest_path.name}."
-    except Exception as e:
-        return f"Failed to move: {str(e)}"
-
-def copy_file_or_folder(source: str, destination: str, filename: str = None):
-    """Copies files or directories reliably across user directories."""
-    try:
-        src_path = resolve_system_path(source)
-        dest_path = resolve_system_path(destination)
-
-        if filename:
-            target_file = src_path / filename if src_path.is_dir() else src_path
-            if not target_file.exists():
-                for sub in [Path.home() / "Downloads", Path.home() / "Documents", Path.home() / "Desktop"]:
-                    if (sub / filename).exists():
-                        target_file = sub / filename
-                        break
-            src_path = target_file
-
-        if not src_path.exists():
-            return f"Source file or folder '{source}' not found."
-
-        dest_path.mkdir(parents=True, exist_ok=True)
-        final_dest = dest_path / src_path.name if dest_path.is_dir() else dest_path
-
-        if src_path.is_dir():
-            shutil.copytree(str(src_path), str(final_dest), dirs_exist_ok=True)
-        else:
-            shutil.copy2(str(src_path), str(final_dest))
-
-        return f"Copied {src_path.name} to {dest_path.name}."
-    except Exception as e:
-        return f"Failed to copy: {str(e)}"
-
-def delete_file_or_folder(target: str):
-    """Safely removes or trashes a file, folder, wildcard path, or entire directory contents."""
-    try:
-        raw = target.strip().strip("'\"")
-
-        # 1. Handle wildcard patterns (e.g. ~/Downloads/* or Downloads/*)
-        if "*" in raw:
-            base_dir_str = raw.split("*")[0].rstrip("/\\")
-            base_dir = resolve_system_path(base_dir_str)
-            if not base_dir.exists() or not base_dir.is_dir():
-                return f"Directory '{base_dir_str}' not found."
-
-            protected = [Path("/"), Path.home(), Path("/etc"), Path("/usr"), Path("/boot"), Path("/bin"), Path("/var")]
-            if base_dir in protected:
-                return "Action blocked: Deleting root or home contents directly is protected."
-
-            items = [p for p in base_dir.iterdir() if not p.name.startswith(".")]
-            if not items:
-                return f"{base_dir.name} is already empty."
-
-            deleted_count = 0
-            for item in items:
-                if shutil.which("gio"):
-                    subprocess.run(["gio", "trash", str(item)], capture_output=True)
-                else:
-                    if item.is_dir():
-                        shutil.rmtree(item)
-                    else:
-                        item.unlink()
-                deleted_count += 1
-            return f"Deleted {deleted_count} items in {base_dir.name}."
-
-        # 2. Check if user passed a directory and wants to delete its contents
-        target_path = resolve_system_path(raw)
-
-        protected = [Path("/"), Path.home(), Path("/etc"), Path("/usr"), Path("/boot"), Path("/bin"), Path("/var")]
-        if target_path in protected:
-            return f"Action blocked: '{raw}' is protected."
-
-        if not target_path.exists():
-            # Check if user meant folder contents by passing folder name
-            for folder_name in ["downloads", "documents", "desktop", "pictures", "videos", "music"]:
-                if folder_name in raw.lower():
-                    parent = resolve_system_path(folder_name)
-                    items = [p for p in parent.iterdir() if not p.name.startswith(".")]
-                    if not items:
-                        return f"{parent.name} is already empty."
-                    deleted_count = 0
-                    for item in items:
-                        if shutil.which("gio"):
-                            subprocess.run(["gio", "trash", str(item)], capture_output=True)
-                        else:
-                            if item.is_dir():
-                                shutil.rmtree(item)
-                            else:
-                                item.unlink()
-                        deleted_count += 1
-                    return f"Deleted {deleted_count} items in {parent.name}."
-            return f"File or folder '{raw}' not found."
-
-        # 3. Single target deletion
-        if shutil.which("gio"):
-            res = subprocess.run(["gio", "trash", str(target_path)], capture_output=True)
-            if res.returncode == 0:
-                return f"Moved {target_path.name} to system trash."
-
-        if target_path.is_file() or target_path.is_symlink():
-            target_path.unlink()
-        elif target_path.is_dir():
-            shutil.rmtree(target_path)
-
-        return f"Deleted {target_path.name}."
-    except Exception as e:
-        return f"Failed to delete: {str(e)}"
-
-def get_current_time_and_date():
-    """Reads the exact real-time clock and calendar date directly from Linux system."""
-    now = datetime.now()
-    time_str = now.strftime("%I:%M %p").lstrip('0')
-    date_str = now.strftime("%A, %B %d, %Y")
-    return f"The current time is {time_str}, and today is {date_str}."
-
-def format_file_size(size_in_bytes: int) -> str:
-    """Converts bytes to a human-readable string."""
-    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
-        if size_in_bytes < 1024.0:
-            return f"{size_in_bytes:.1f} {unit}" if unit != 'B' else f"{int(size_in_bytes)} B"
-        size_in_bytes /= 1024.0
-    return f"{size_in_bytes:.1f} PB"
-
-def get_item_disk_size(path: Path) -> int:
-    """Calculates file size or directory size."""
-    try:
-        if path.is_file() or path.is_symlink():
-            return path.stat().st_size
-        elif path.is_dir():
-            total = 0
-            for entry in path.rglob('*'):
-                try:
-                    if entry.is_file():
-                        total += entry.stat().st_size
-                except (PermissionError, FileNotFoundError):
-                    continue
-            return total
-    except (PermissionError, FileNotFoundError):
-        return 0
-    return 0
-
-def list_directory_files(directory: str = "~", sorted_by: str = None, order: str = "desc", **kwargs):
-    """Lists files and folders, supporting sorting by space/size or date with human-readable space calculation."""
-    target_dir = resolve_system_path(directory)
-    if not target_dir.exists() or not target_dir.is_dir():
-        return f"Directory {directory} does not exist."
-
-    sort_key = (sorted_by or kwargs.get("sort_by") or kwargs.get("by") or "").lower().strip()
-
-    try:
-        entries = [item for item in target_dir.iterdir() if not item.name.startswith(".")]
-        if not entries:
-            return f"The directory {target_dir.name} is empty."
-
-        if any(k in sort_key for k in ["size", "space", "storage", "bytes", "large", "heavy"]):
-            items_with_size = [(item, get_item_disk_size(item)) for item in entries]
-            reverse_order = False if "asc" in order.lower() else True
-            items_with_size.sort(key=lambda x: x[1], reverse=reverse_order)
-            
-            top_items = items_with_size[:6]
-            formatted_list = [f"{item.name} ({format_file_size(sz)})" for item, sz in top_items]
-            result_str = ", ".join(formatted_list)
-            
-            if len(items_with_size) > 6:
-                return f"Files by space: {result_str}, and {len(items_with_size) - 6} more."
-            return f"Files by space: {result_str}."
-
-        elif any(k in sort_key for k in ["date", "time", "recent", "modified"]):
-            reverse_order = False if "asc" in order.lower() else True
-            entries.sort(key=lambda x: x.stat().st_mtime, reverse=reverse_order)
-            names = [item.name for item in entries[:8]]
-            return "Files: " + ", ".join(names)
-
-        else:
-            entries.sort(key=lambda x: x.name.lower())
-            names = [item.name for item in entries[:8]]
-            if len(entries) > 8:
-                return f"Directory has {len(entries)} items: " + ", ".join(names) + ", and more."
-            return "Files: " + ", ".join(names)
-
-    except Exception as e:
-        return f"Could not list directory: {str(e)}"
-
-def run_terminal_command(command: str):
-    """Executes bash commands directly and returns concise terminal output."""
-    blacklist = ["rm -rf /", "mkfs", "dd if=", ":(){ :|:& };:"]
-    if any(b in command for b in blacklist):
-        return "Command blocked by security guardrails."
-    
-    try:
-        res = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=8)
-        out = (res.stdout or res.stderr).strip()
-        if not out:
-            return "Command executed with no output."
-        lines = [line.strip() for line in out.splitlines() if line.strip()]
-        if len(lines) > 6:
-            summary = ", ".join(lines[:6])
-            return f"Found {len(lines)} items: {summary}, and more."
-        return ", ".join(lines)
-    except subprocess.TimeoutExpired:
-        return "Command timed out after 8 seconds."
-    except Exception as e:
-        return f"Error executing command: {str(e)}"
-
-def type_query_into_site(target_site: str, text_to_type: str, press_enter: bool = True):
-    """Opens a website or web app and types the query into its input box."""
-    if not shutil.which("xdotool"):
-        return "xdotool is not installed. Please run: sudo apt install xdotool"
-
-    site_clean = target_site.lower().strip()
-    site_map = {
-        "gemini": "https://gemini.google.com/app",
-        "chatgpt": "https://chatgpt.com",
-        "claude": "https://claude.ai",
-        "youtube": "https://youtube.com",
-        "google": "https://google.com",
-        "reddit": "https://reddit.com",
-        "github": "https://github.com",
-        "twitter": "https://x.com",
-        "x": "https://x.com"
-    }
-
-    url = site_map.get(site_clean, None)
-    if not url:
-        if site_clean.startswith("http://") or site_clean.startswith("https://"):
-            url = site_clean
-        else:
-            url = f"https://{site_clean}.com"
-
-    subprocess.Popen(["xdg-open", url])
-
-    def _type_worker():
-        time.sleep(2.6)
-        subprocess.run("xdotool click 1", shell=True)
-        time.sleep(0.1)
-        subprocess.run("xdotool key --clearmodifiers Tab", shell=True)
-        time.sleep(0.1)
-
-        clean_text = text_to_type.replace('"', '\\"').strip()
-        enter_cmd = "\nsleep 0.2\nxdotool key Return" if press_enter else ""
-        script = f"""
-        xdotool type --delay 25 "{clean_text}"{enter_cmd}
-        """
-        subprocess.run(script, shell=True)
-
-    threading.Thread(target=_type_worker, daemon=True).start()
-    return f"Opening {site_clean.title()} and entering your prompt: '{text_to_type}'."
-
-def browser_action(action: str):
-    """Controls browser navigation."""
-    if not shutil.which("xdotool"):
-        return "xdotool is not installed. Please run: sudo apt install xdotool"
-
-    act = action.lower().strip()
-    actions = {
-        "close_tab": "ctrl+w",
-        "close_window": "ctrl+shift+w",
-        "back": "alt+Left",
-        "forward": "alt+Right",
-        "refresh": "ctrl+r",
-        "new_tab": "ctrl+t",
-        "scroll_down": "Page_Down",
-        "scroll_up": "Page_Up",
-        "fullscreen": "f",
-        "toggle_media": "space"
-    }
-
-    if act not in actions:
-        return f"Unknown browser action: {action}"
-
-    key = actions[act]
-    subprocess.run(f"xdotool key --clearmodifiers {key}", shell=True)
-    return f"Browser: {act.replace('_', ' ')} executed."
-
-def browser_click_link(target: str):
-    """Clicks a link by position or visible text."""
-    if not shutil.which("xdotool"):
-        return "xdotool is not installed. Run 'sudo apt install xdotool' to enable clicking."
-
-    target_clean = target.lower().strip()
-    ordinal_map = {
-        "first": 1, "1st": 1,
-        "second": 2, "2nd": 2,
-        "third": 3, "3rd": 3,
-        "fourth": 4, "4th": 4,
-        "fifth": 5, "5th": 5
-    }
-
-    pos = None
-    for word, num in ordinal_map.items():
-        if word in target_clean:
-            pos = num
-            break
-
-    if pos is not None:
-        tab_presses = " ".join(["key Tab"] * (pos + 2))
-        script = f"""
-        xdotool key --clearmodifiers Escape
-        sleep 0.1
-        xdotool {tab_presses}
-        sleep 0.1
-        xdotool key Return
-        """
-        subprocess.run(script, shell=True)
-        return f"Clicked the {target_clean}."
-
-    clean_kw = target.replace('"', '\\"').strip()
-    script = f"""
-    xdotool key --clearmodifiers ctrl+f
-    sleep 0.1
-    xdotool type --delay 15 "{clean_kw}"
-    sleep 0.1
-    xdotool key Return
-    sleep 0.1
-    xdotool key Escape
-    sleep 0.1
-    xdotool key Return
-    """
-    subprocess.run(script, shell=True)
-    return f"Clicked '{target}'."
-
-def start_gmail_login():
-    """Opens Gmail login page and begins guided sign-in."""
-    global PENDING_ACTION
-    subprocess.Popen(["xdg-open", "https://accounts.google.com/signin/v2/identifier?service=mail"])
-    PENDING_ACTION = {"state": "waiting_email"}
-    return "I've opened the Gmail login page. What is your email address or account name?"
-
-def enter_browser_text(text: str, press_enter: bool = True):
-    """Types text directly into the focused field in the browser."""
-    if not shutil.which("xdotool"):
-        return "xdotool is not installed."
-    clean_txt = text.replace('"', '\\"').strip()
-    enter_cmd = "\nsleep 0.2\nxdotool key Return" if press_enter else ""
-    script = f"""
-    sleep 0.4
-    xdotool type --delay 45 "{clean_txt}"{enter_cmd}
-    """
-    subprocess.run(script, shell=True)
-    return f"Typed '{text}'."
-
-def web_search(query: str, platform: str = "auto"):
-    """Searches YouTube or Google directly, opening in a new tab/window."""
-    q_clean = query.lower()
-    if "youtube" in platform.lower() or "youtube" in q_clean or "video" in q_clean or "song" in q_clean:
-        cleaned_query = re.sub(r'\b(on youtube|in youtube|youtube|videos on|video of|search for|play)\b', '', query, flags=re.I).strip()
-        final_query = cleaned_query if cleaned_query else query
-        encoded = urllib.parse.quote_plus(final_query)
-        url = f"https://www.youtube.com/results?search_query={encoded}"
-        subprocess.Popen(["xdg-open", url])
-        return f"Searching YouTube for '{final_query}'"
-
-    encoded = urllib.parse.quote_plus(query)
-    url = f"https://www.google.com/search?q={encoded}"
-    subprocess.Popen(["xdg-open", url])
-    return f"Searching Google for '{query}'"
-
 def launch_app(app_name: str):
-    """Launches desktop applications, user folders, or websites."""
+    """Launches desktop applications, terminals, or browsers cleanly under Wayland/systemd."""
     clean = app_name.lower().strip()
+    env = get_desktop_env()
 
-    common_folders = ["documents", "downloads", "desktop", "pictures", "videos", "music", "home"]
-    if clean in common_folders or any(clean == f"{cf} folder" for cf in common_folders):
-        base_folder = clean.replace(" folder", "").strip()
-        return open_folder(base_folder)
+    if clean in ["terminal", "new terminal", "terminal window", "gnome terminal", "console"]:
+        for term_bin in ["gnome-terminal --window", "ptyxis --new-window", "alacritty", "kitty", "x-terminal-emulator"]:
+            bin_name = term_bin.split()[0]
+            if shutil.which(bin_name):
+                subprocess.Popen(term_bin, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                emit_status("LOG", "Opened Terminal")
+                return "Opened a new terminal window."
 
-    web_targets = {
-        "google": "https://google.com",
-        "youtube": "https://youtube.com",
-        "gemini": "https://gemini.google.com",
-        "chatgpt": "https://chatgpt.com",
-        "github": "https://github.com",
-        "reddit": "https://reddit.com"
-    }
-    if clean in web_targets:
-        subprocess.Popen(["xdg-open", web_targets[clean]])
-        return f"Opened {clean.title()}."
+    if clean in ["text editor", "editor", "gedit", "gnome text editor"]:
+        for ed in ["gnome-text-editor", "gedit", "kate"]:
+            if shutil.which(ed):
+                subprocess.Popen([ed], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                emit_status("LOG", "Opened Text Editor")
+                return "Opened the text editor."
+
+    if clean in ["firefox", "browser", "chrome", "google chrome"]:
+        for br in (["firefox"] if "firefox" in clean else ["google-chrome", "chromium", "firefox", "brave-browser"]):
+            if shutil.which(br):
+                subprocess.Popen([br], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                emit_status("LOG", f"Opened {br.title()}")
+                return f"Opened {br.title()}."
+
+    if clean in ["files", "file manager"]:
+        return open_folder("home")
+
+    if clean in ["trash", "trash bin", "rubbish"]:
+        return open_trash()
 
     app_map = {
-        "app store": ["snap-store", "gnome-software", "ubuntu-software"],
-        "store": ["snap-store", "gnome-software"],
-        "software": ["snap-store", "gnome-software"],
-        "files": ["nautilus"],
-        "file manager": ["nautilus"],
-        "text editor": ["gnome-text-editor", "gedit", "kate"],
-        "editor": ["gnome-text-editor", "gedit"],
-        "terminal": ["gnome-terminal", "ptyxis", "alacritty", "kitty"],
-        "calculator": ["gnome-calculator"],
-        "settings": ["gnome-control-center"],
-        "browser": ["google-chrome", "firefox", "brave-browser", "chromium"],
-        "chrome": ["google-chrome"],
+        "app center": ["snap-store", "ubuntu-app-center", "gnome-software"],
+        "calculator": ["gnome-calculator"], "settings": ["gnome-control-center"],
         "code": ["code"]
     }
     candidates = app_map.get(clean, [clean])
-
     for c in candidates:
-        if subprocess.run(["gtk-launch", c], capture_output=True).returncode == 0:
+        if subprocess.run(["gtk-launch", c], env=env, capture_output=True).returncode == 0:
+            emit_status("LOG", f"Launched: {app_name}")
             return f"Opened {app_name}."
-    for c in candidates:
         if shutil.which(c):
-            subprocess.Popen([c], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.Popen([c], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            emit_status("LOG", f"Launched: {app_name}")
             return f"Opened {app_name}."
 
-    desktop_dirs = [Path("/usr/share/applications"), Path.home() / ".local/share/applications"]
-    for d in desktop_dirs:
-        if d.exists():
-            for f in d.glob("*.desktop"):
-                if clean in f.name.lower():
-                    subprocess.Popen(["gtk-launch", f.stem], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    return f"Opened {app_name}."
     return f"Could not find application '{app_name}'."
 
-def close_application(app_name: str):
-    """Closes applications cleanly without permission errors."""
-    app_clean = app_name.lower().strip()
-    alias_map = {
-        "files": ["nautilus", "org.gnome.Nautilus"],
-        "file manager": ["nautilus"],
-        "text editor": ["gnome-text-editor", "gedit"],
-        "editor": ["gnome-text-editor", "gedit"],
-        "browser": ["chrome", "firefox", "brave"],
-        "app store": ["snap-store", "gnome-software"],
-        "store": ["snap-store", "gnome-software"],
-        "code": ["code"],
-        "terminal": ["gnome-terminal-server", "ptyxis"]
-    }
-    targets = alias_map.get(app_clean, [app_clean])
-
-    gnome_bus_map = {
-        "files": "org.gnome.Nautilus",
-        "text editor": "org.gnome.TextEditor",
-        "app store": "org.gnome.Software"
-    }
-    if app_clean in gnome_bus_map:
-        bus = gnome_bus_map[app_clean]
-        res = subprocess.run([
-            "gdbus", "call", "--session", "--dest", bus,
-            "--object-path", f"/{bus.replace('.', '/')}",
-            "--method", "org.gtk.Actions.Activate", "quit", "[]", "{}"
-        ], capture_output=True)
-        if res.returncode == 0:
-            return f"Closed {app_name}."
-
-    current_user = os.environ.get("USER", "")
-    for t in targets:
-        pkill_cmd = ["pkill", "-15", "-u", current_user, "-f", t] if current_user else ["pkill", "-15", "-f", t]
-        res = subprocess.run(pkill_cmd, capture_output=True)
-        if res.returncode == 0:
-            return f"Closed {app_name}."
-    return f"No running window found for {app_name}."
-
-def open_local_file(filepath: str, app: str = None):
-    p = resolve_system_path(filepath)
-    if not p.exists():
-        return f"File {filepath} not found."
-    if p.is_dir():
-        return open_folder(str(p))
-    if (app and "code" in app.lower()) or (p.suffix in [".py", ".js", ".ts", ".json"] and shutil.which("code")):
-        subprocess.Popen(["code", str(p)])
-        return f"Opened {p.name} in VS Code."
-    subprocess.Popen(["xdg-open", str(p)])
-    return f"Opened {p.name}."
-
 def set_system_volume(percent: int = None, delta: int = None):
-    subprocess.run("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null || pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null", shell=True)
-    if delta is not None:
-        sign = "+" if delta > 0 else "-"
-        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{abs(delta)}%{sign}"], capture_output=True)
-        return f"Volume adjusted by {delta} percent."
-    if percent is not None:
-        percent = max(0, min(100, int(percent)))
-        subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", str(round(percent/100.0, 2))], capture_output=True)
-        return f"Volume set to {percent} percent."
-    return "Could not determine volume level."
+    try:
+        subprocess.run("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null || pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null", shell=True)
+        if delta is not None:
+            sign = "+" if delta > 0 else "-"
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", f"{abs(delta)}%{sign}"], capture_output=True)
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{delta:+d}%"], capture_output=True)
+            emit_status("LOG", f"Volume: {delta:+d}%")
+            return f"Volume adjusted by {delta} percent."
+        if percent is not None:
+            pct = max(0, min(100, int(percent)))
+            subprocess.run(["wpctl", "set-volume", "@DEFAULT_AUDIO_SINK@", str(round(pct / 100.0, 2))], capture_output=True)
+            subprocess.run(["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{pct}%"], capture_output=True)
+            emit_status("LOG", f"Volume: {pct}%")
+            return f"Volume set to {pct} percent."
+    except Exception as e:
+        return f"Failed to change volume: {str(e)}"
+    return "Volume command not understood."
 
-def get_storage_status():
-    total, used, free = shutil.disk_usage("/")
-    return f"You have {free // (2**30)} GB free out of {total // (2**30)} GB."
+def set_system_brightness(percent: int = None, delta: int = None):
+    emit_status("LOG", "Adjusting screen brightness...")
+    try:
+        if not shutil.which("brightnessctl"):
+            return "brightnessctl is not installed. Please run: sudo apt install brightnessctl"
+        if delta is not None:
+            sign = "+" if delta > 0 else "-"
+            subprocess.run(["brightnessctl", "set", f"{abs(delta)}%{sign}"], capture_output=True)
+            emit_status("LOG", f"Brightness: {delta:+d}%")
+            return f"Brightness adjusted by {delta} percent."
+        if percent is not None:
+            pct = max(1, min(100, int(percent)))
+            subprocess.run(["brightnessctl", "set", f"{pct}%"], capture_output=True)
+            emit_status("LOG", f"Brightness: {pct}%")
+            return f"Brightness set to {pct} percent."
+    except Exception as e:
+        return f"Failed to set brightness: {str(e)}"
+    return "Brightness command not understood."
 
-def get_battery_status():
-    for b in Path("/sys/class/power_supply").glob("BAT*"):
-        cap = (b / "capacity").read_text().strip() if (b / "capacity").exists() else None
-        stat = (b / "status").read_text().strip() if (b / "status").exists() else None
-        if cap:
-            return f"Battery is at {cap}% and {stat}."
-    return "Battery info unavailable."
+def get_current_time_and_date():
+    now = datetime.now()
+    time_str = now.strftime("%I:%M %p").lstrip('0')
+    date_str = now.strftime("%A, %B %d, %Y")
+    emit_status("LOG", f"Time checked: {time_str}")
+    return f"The current time is {time_str}, and today is {date_str}."
 
+def open_folder(folder_name: str = "home", subfolder_of: str = None):
+    clean = folder_name.lower().strip() if folder_name else "home"
+    env = get_desktop_env()
+
+    if subfolder_of:
+        parent = resolve_system_path(subfolder_of)
+        target = parent / clean
+    else:
+        target = resolve_system_path(clean)
+
+    if not target.exists():
+        if "new folder" in clean:
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            return f"Folder '{clean}' not found."
+
+    subprocess.Popen(["xdg-open", str(target)], env=env)
+    emit_status("LOG", f"Opened folder: {target.name}")
+    return f"Opened {target.name} folder."
+
+def open_file_anywhere(filename: str, folder: str = None):
+    clean_name = filename.strip().strip("'\"")
+    env = get_desktop_env()
+    emit_status("LOG", f"Locating and opening '{clean_name}'...")
+
+    target_path = None
+    if folder:
+        base = resolve_system_path(folder)
+        candidate = base / clean_name
+        if candidate.exists():
+            target_path = candidate
+
+    if not target_path:
+        for search_base in [Path.home() / "Pictures/Screenshots", Path.home() / "Pictures",
+                            Path.home() / "Downloads", Path.home() / "Documents",
+                            Path.home() / "Desktop", Path.home()]:
+            if not search_base.exists():
+                continue
+            matches = list(search_base.rglob(clean_name))
+            if matches:
+                target_path = matches[0]
+                break
+
+    if target_path and target_path.exists():
+        subprocess.Popen(["xdg-open", str(target_path)], env=env)
+        emit_status("LOG", f"Opened file: {target_path.name}")
+        return f"Opened {target_path.name}."
+    return f"Could not find '{clean_name}' to open."
+
+def find_file_or_folder(target: str = "", min_size_mb: float = None, search_dir: str = "~"):
+    clean = target.strip().strip("'\"") if target else ""
+    base = resolve_system_path(search_dir)
+    emit_status("LOG", f"Searching files {clean or f'> {min_size_mb}MB'}...")
+
+    size_match = re.search(r'(\d+)\s*(mb|gb|kb)', clean.lower())
+    if size_match and min_size_mb is None:
+        val = float(size_match.group(1))
+        unit = size_match.group(2)
+        min_size_mb = val if unit == 'mb' else (val * 1024 if unit == 'gb' else val / 1024)
+        clean = ""
+
+    results = []
+    threshold_bytes = (min_size_mb * 1024 * 1024) if min_size_mb else 0
+
+    scan_dirs = [base] if base != Path.home() else [
+        Path.home() / "Downloads", Path.home() / "Documents",
+        Path.home() / "Videos", Path.home() / "Pictures",
+        Path.home() / "Desktop", Path.home()
+    ]
+
+    for d in scan_dirs:
+        if not d.exists():
+            continue
+        try:
+            for p in d.rglob("*"):
+                if p.is_file() and not any(part.startswith(".") for part in p.parts):
+                    if clean and clean.lower() not in p.name.lower():
+                        continue
+                    if threshold_bytes > 0:
+                        try:
+                            if p.stat().st_size < threshold_bytes:
+                                continue
+                        except Exception:
+                            continue
+                    sz_mb = p.stat().st_size / (1024 * 1024)
+                    results.append(f"{p.name} ({sz_mb:.1f} MB in {p.parent.name})")
+                    if len(results) >= 8:
+                        break
+        except Exception:
+            continue
+        if len(results) >= 8:
+            break
+
+    if results:
+        emit_status("LOG", f"Found {len(results)} matches.")
+        return f"Found matching files: {', '.join(results)}."
+    return "No matching files found."
+
+def list_files_by_type_or_state(file_type: str = "all", directory: str = "~", include_hidden: bool = False):
+    target_dir = resolve_system_path(directory)
+    if not target_dir.exists() or not target_dir.is_dir():
+        return f"Directory '{directory}' does not exist."
+
+    type_exts = {
+        "pdf": [".pdf"],
+        "image": [".png", ".jpg", ".jpeg", ".webp", ".gif"],
+        "images": [".png", ".jpg", ".jpeg", ".webp", ".gif"],
+        "video": [".mp4", ".mkv", ".avi", ".mov"],
+        "document": [".pdf", ".docx", ".txt", ".md", ".csv"],
+        "all": []
+    }
+    valid_exts = type_exts.get(file_type.lower().strip(), [])
+
+    items = []
+    for p in target_dir.iterdir():
+        if not include_hidden and p.name.startswith("."):
+            continue
+        if include_hidden and not p.name.startswith("."):
+            continue
+        if valid_exts and p.suffix.lower() not in valid_exts:
+            continue
+        items.append(p.name)
+
+    if not items:
+        category = "hidden" if include_hidden else file_type
+        return f"No {category} files found in {target_dir.name}."
+
+    summary = ", ".join(items[:10])
+    count_extra = len(items) - 10
+    if count_extra > 0:
+        summary += f", and {count_extra} more"
+    emit_status("LOG", f"Listed {len(items)} files.")
+    return f"Files: {summary}."
+
+def get_disk_usage_and_clean_advice():
+    total, used, free = shutil.disk_usage(Path.home())
+    free_gb = free // (2**30)
+    total_gb = total // (2**30)
+
+    cleanable = []
+    cache_dir = Path.home() / ".cache"
+    if cache_dir.exists():
+        cleanable.append("User Cache (~/.cache)")
+
+    down_dir = Path.home() / "Downloads"
+    if down_dir.exists():
+        old_installers = list(down_dir.glob("*.deb")) + list(down_dir.glob("*.iso")) + list(down_dir.glob("*.tar.gz"))
+        if old_installers:
+            cleanable.append(f"{len(old_installers)} installers in Downloads")
+
+    trash_dir = Path.home() / ".local/share/Trash/files"
+    if trash_dir.exists() and any(trash_dir.iterdir()):
+        cleanable.append("Trash bin contents")
+
+    advice = f"You have {free_gb} GB free out of {total_gb} GB. "
+    if cleanable:
+        advice += f"Recommended items to clean: {', '.join(cleanable)}."
+    else:
+        advice += "Your disk space is well optimized."
+    emit_status("LOG", f"Disk: {free_gb}GB free")
+    return advice
+
+def empty_trash():
+    env = get_desktop_env()
+    try:
+        if shutil.which("gio"):
+            subprocess.run(["gio", "trash", "--empty"], env=env, capture_output=True)
+            emit_status("LOG", "Trash emptied.")
+            return "The trash has been emptied."
+    except Exception:
+        pass
+    return "Trash emptied."
+
+def open_trash():
+    env = get_desktop_env()
+    subprocess.Popen(["xdg-open", "trash://"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    emit_status("LOG", "Opened Trash.")
+    return "Opened the trash bin."
+
+def copy_file_or_folder(source: str, destination: str, filename: str = None):
+    try:
+        src = resolve_system_path(source)
+        dest = resolve_system_path(destination)
+        if filename:
+            src = src / filename if src.is_dir() else src
+        if not src.exists():
+            for b in [Path.home() / "Documents", Path.home() / "Downloads", Path.home() / "Desktop"]:
+                if (b / source).exists():
+                    src = b / source
+                    break
+        dest.mkdir(parents=True, exist_ok=True)
+        if src.is_dir():
+            shutil.copytree(str(src), str(dest / src.name), dirs_exist_ok=True)
+        else:
+            shutil.copy2(str(src), str(dest / src.name if dest.is_dir() else dest))
+        emit_status("LOG", f"Copied {src.name} -> {dest.name}")
+        return f"Copied {src.name} to {dest.name}."
+    except Exception as e:
+        return f"Failed: {str(e)}"
+
+def delete_file_or_folder(target: str, folder: str = None):
+    try:
+        raw = target.strip().strip("'\"")
+        candidate = resolve_system_path(folder) / raw if folder else resolve_system_path(raw)
+        if not candidate.exists():
+            for b in [Path.home() / "Downloads", Path.home() / "Documents", Path.home() / "Desktop"]:
+                if (b / raw).exists():
+                    candidate = b / raw
+                    break
+        if candidate.exists():
+            subprocess.run(["gio", "trash", str(candidate)], capture_output=True)
+            emit_status("LOG", f"Deleted: {candidate.name}")
+            return f"Deleted {candidate.name}."
+    except Exception as e:
+        return f"Failed: {str(e)}"
+    return f"File '{target}' not found."
+
+def control_window_state(app_name: str = None, action: str = "minimize"):
+    clean_act = (action or "minimize").lower().strip()
+    clean_app = (app_name or "").lower().strip()
+    env = get_desktop_env()
+
+    alias_map = {
+        "browser": ["firefox", "chrome"], "firefox": ["firefox"], "chrome": ["google-chrome"],
+        "terminal": ["gnome-terminal", "ptyxis"], "files": ["nautilus"]
+    }
+    win_id = None
+    if shutil.which("xdotool"):
+        for c in alias_map.get(clean_app, [clean_app]):
+            try:
+                out = subprocess.check_output(f"xdotool search --onlyvisible --class '{c}' 2>/dev/null", shell=True, env=env).decode().strip()
+                if out:
+                    win_id = out.splitlines()[-1]
+                    break
+            except Exception:
+                continue
+
+    if win_id and shutil.which("xdotool"):
+        if clean_act in ["minimize", "minimise", "hide"]:
+            subprocess.run(f"xdotool windowminimize {win_id}", shell=True, env=env)
+        elif clean_act in ["maximize", "maximise"]:
+            subprocess.run(f"xdotool windowactivate {win_id}; xdotool key alt+F10", shell=True, env=env)
+        return f"{clean_act.title()}d {clean_app or 'window'}."
+
+    if shutil.which("xdotool"):
+        key = "Super+h" if "min" in clean_act else "Super+Up"
+        subprocess.run(f"xdotool key {key}", shell=True, env=env)
+        return f"{clean_act.title()}d active window."
+    return "Window control unavailable."
+
+def close_application(app_name: str):
+    clean = app_name.lower().strip()
+    alias_map = {"browser": ["firefox", "chrome"], "firefox": ["firefox"], "files": ["nautilus"]}
+    for t in alias_map.get(clean, [clean]):
+        subprocess.run(["pkill", "-15", "-f", t], capture_output=True)
+    emit_status("LOG", f"Closed: {app_name}")
+    return f"Closed {app_name}."
+
+def web_search(query: str, platform: str = "auto"):
+    q_clean = query.lower().strip()
+    if q_clean in ["youtube", "open youtube"]:
+        subprocess.Popen(["xdg-open", "https://www.youtube.com"], env=get_desktop_env())
+        return "Opened YouTube."
+    if q_clean in ["google", "open google"]:
+        subprocess.Popen(["xdg-open", "https://www.google.com"], env=get_desktop_env())
+        return "Opened Google."
+
+    if "youtube" in platform.lower() or any(k in q_clean for k in ["video", "song", "play"]):
+        url = f"https://www.youtube.com/results?search_query={urllib.parse.quote_plus(query)}"
+    else:
+        url = f"https://www.google.com/search?q={urllib.parse.quote_plus(query)}"
+    subprocess.Popen(["xdg-open", url], env=get_desktop_env())
+    emit_status("LOG", f"Searched: {query}")
+    return f"Searching for '{query}'."
+
+def generate_and_save_code(filename: str, language: str, description: str, folder: str = "Desktop"):
+    target_folder = resolve_system_path(folder)
+    target_folder.mkdir(parents=True, exist_ok=True)
+    file_path = target_folder / filename
+
+    emit_status("LOG", f"Generating {language} code for {filename}...")
+    prompt = f"Write complete, production-ready {language} code for: {description}. Return ONLY the raw code without markdown backticks or conversational explanations."
+    try:
+        res = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
+        raw_code = res.get("message", {}).get("content", "")
+        cleaned_code = re.sub(r"^```[\w]*\n", "", raw_code, flags=re.MULTILINE)
+        cleaned_code = re.sub(r"```$", "", cleaned_code, flags=re.MULTILINE).strip()
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(cleaned_code)
+
+        emit_status("LOG", f"Saved: {file_path.name} in {target_folder.name}")
+        return f"Generated {language} program and saved it as {filename} in {target_folder.name}."
+    except Exception as e:
+        return f"Failed to generate code: {str(e)}"
+
+def execute_code_file(filename: str, folder: str = None, interactive: bool = True):
+    file_path = None
+    if folder:
+        f_dir = resolve_system_path(folder)
+        if (f_dir / filename).exists():
+            file_path = f_dir / filename
+
+    if not file_path:
+        for sub in [Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads", Path.home()]:
+            if (sub / filename).exists():
+                file_path = sub / filename
+                break
+
+    if not file_path or not file_path.exists():
+        return f"File '{filename}' not found for execution."
+
+    emit_status("LOG", f"Executing: {file_path.name}...")
+    ext = file_path.suffix.lower()
+    env = get_desktop_env()
+
+    if ext == ".py":
+        interp = "python3"
+    elif ext == ".sh":
+        interp = "bash"
+    elif ext in [".js", ".mjs"]:
+        interp = "node"
+    elif ext == ".go":
+        interp = "go run"
+    else:
+        interp = "xdg-open"
+
+    needs_interactive = interactive
+    try:
+        content = file_path.read_text(encoding="utf-8", errors="ignore")
+        if any(kw in content for kw in ["input(", "readline(", "read -p", "prompt("]):
+            needs_interactive = True
+    except Exception:
+        pass
+
+    if needs_interactive:
+        for term in ["gnome-terminal", "ptyxis", "alacritty", "kitty", "x-terminal-emulator"]:
+            if shutil.which(term):
+                if term == "gnome-terminal":
+                    cmd = f'gnome-terminal --title="{file_path.name}" -- bash -c "{interp} \\"{file_path}\\"; echo; echo \\"[Process completed. Press Enter to close]\\"; read; exec bash"'
+                else:
+                    cmd = f'{term} -e bash -c "{interp} \\"{file_path}\\"; echo; echo \\"[Process completed. Press Enter to close]\\"; read"'
+                subprocess.Popen(cmd, shell=True, env=env)
+                emit_status("LOG", f"Launched {file_path.name} in terminal window.")
+                return f"Opened and executed {file_path.name} in a new terminal window."
+
+    try:
+        run_cmd = [interp, str(file_path)] if " " not in interp else interp.split() + [str(file_path)]
+        res = subprocess.run(run_cmd, capture_output=True, text=True, timeout=12)
+        out = (res.stdout or res.stderr).strip()
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        result_preview = ", ".join(lines) if lines else "Program executed with no output."
+        emit_status("LOG", f"Output: {result_preview}")
+        return f"Execution finished. Output: {result_preview}"
+    except subprocess.TimeoutExpired:
+        return f"Program '{filename}' timed out after 12 seconds."
+    except Exception as e:
+        return f"Failed to execute '{filename}': {str(e)}"
+
+# ==========================================
+# 5. DISPATCHER & TOOL SCHEMAS
+# ==========================================
 AVAILABLE_TOOLS = {
+    "launch_app": launch_app,
+    "set_system_brightness": set_system_brightness,
+    "set_system_volume": set_system_volume,
     "open_folder": open_folder,
-    "select_item_in_file_manager": select_item_in_file_manager,
-    "move_file_or_folder": move_file_or_folder,
+    "open_file_anywhere": open_file_anywhere,
+    "find_file_or_folder": find_file_or_folder,
+    "list_files_by_type_or_state": list_files_by_type_or_state,
+    "get_disk_usage_and_clean_advice": get_disk_usage_and_clean_advice,
+    "get_current_time_and_date": get_current_time_and_date,
+    "empty_trash": empty_trash,
+    "open_trash": open_trash,
     "copy_file_or_folder": copy_file_or_folder,
     "delete_file_or_folder": delete_file_or_folder,
-    "get_current_time_and_date": get_current_time_and_date,
-    "list_directory_files": list_directory_files,
-    "run_terminal_command": run_terminal_command,
-    "type_query_into_site": type_query_into_site,
-    "enter_browser_text": enter_browser_text,
-    "browser_action": browser_action,
-    "browser_click_link": browser_click_link,
-    "start_gmail_login": start_gmail_login,
-    "web_search": web_search,
-    "launch_app": launch_app,
+    "generate_and_save_code": generate_and_save_code,
+    "execute_code_file": execute_code_file,
     "close_application": close_application,
-    "open_local_file": open_local_file,
-    "set_system_volume": set_system_volume,
-    "get_storage_status": get_storage_status,
-    "get_battery_status": get_battery_status
+    "control_window_state": control_window_state,
+    "web_search": web_search
 }
 
 TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "delete_file_or_folder",
-            "description": "Deletes or moves a file, folder, wildcard path (e.g. '~/Downloads/*'), or entire directory contents to the trash safely.",
+            "name": "set_system_brightness",
+            "description": "Adjusts screen brightness/backlight (e.g. 'increase the brightness to 100%', 'dim display by 20%').",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "target": {
-                        "type": "string",
-                        "description": "Path, file, or folder pattern to delete (e.g. '~/Downloads/*', 'Downloads', 'test.txt')"
-                    }
-                },
-                "required": ["target"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "open_folder",
-            "description": "Opens a system folder or directory in the file manager (e.g. 'documents', 'downloads', 'desktop', 'pictures', 'videos', 'music').",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "folder_name": {"type": "string", "description": "Name or path of folder, e.g. 'documents', 'downloads', 'music'"}
-                },
-                "required": ["folder_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "select_item_in_file_manager",
-            "description": "Selects, clicks, or opens a folder or file by name inside the currently open Files / Nautilus window (e.g. 'click on snap folder', 'open snap folder', 'open test.py').",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "item_name": {"type": "string", "description": "Name of the folder or file to click, e.g. 'snap', 'projects', 'notes'"}
-                },
-                "required": ["item_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "move_file_or_folder",
-            "description": "Moves a file or folder from a source folder/path to a destination folder/path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string", "description": "Source path or folder, e.g. 'Downloads/pass.txt' or 'Downloads'"},
-                    "destination": {"type": "string", "description": "Destination directory, e.g. 'Documents' or '~/Desktop'"},
-                    "filename": {"type": "string", "description": "Optional name of file if source is only a folder, e.g. 'pass.txt'"}
-                },
-                "required": ["source", "destination"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "copy_file_or_folder",
-            "description": "Copies a file or folder from a source folder/path to a destination folder/path.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "source": {"type": "string", "description": "Source file or folder path, e.g. 'Downloads/report.pdf'"},
-                    "destination": {"type": "string", "description": "Destination folder, e.g. 'Documents'"},
-                    "filename": {"type": "string", "description": "Optional file name, e.g. 'report.pdf'"}
-                },
-                "required": ["source", "destination"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_current_time_and_date",
-            "description": "Reads the exact real-time clock and current date from the operating system.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory_files",
-            "description": "Lists files/folders in a directory. Supports sorting by space/size or date, and reports space taken up.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "directory": {"type": "string", "description": "Target folder, e.g. '~' or '~/Downloads'"},
-                    "sorted_by": {
-                        "type": "string",
-                        "enum": ["space", "size", "date", "name"],
-                        "description": "Property to sort by, like 'space' or 'size'"
-                    },
-                    "order": {
-                        "type": "string",
-                        "enum": ["desc", "asc"],
-                        "description": "Sorting direction (desc = largest/newest first)"
-                    }
+                    "percent": {"type": "integer", "description": "Target percentage 1-100"},
+                    "delta": {"type": "integer", "description": "Delta to increase or decrease"}
                 }
             }
         }
@@ -840,151 +676,8 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "run_terminal_command",
-            "description": "Executes shell commands (e.g. 'ls', 'pwd', 'df', 'free') and returns output.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "The exact shell command to run"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "type_query_into_site",
-            "description": "Opens a web app or platform (like Gemini, ChatGPT, Claude, YouTube, etc.) and types a specified prompt into its input box.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target_site": {
-                        "type": "string",
-                        "description": "Target site name, e.g. 'gemini', 'chatgpt', 'youtube'"
-                    },
-                    "text_to_type": {
-                        "type": "string",
-                        "description": "Prompt or message to type"
-                    },
-                    "press_enter": {
-                        "type": "boolean",
-                        "description": "Whether to hit Enter after typing"
-                    }
-                },
-                "required": ["target_site", "text_to_type"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "enter_browser_text",
-            "description": "Types text directly into the focused field in the browser.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "text": {"type": "string", "description": "Text to type"},
-                    "press_enter": {"type": "boolean"}
-                },
-                "required": ["text"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_action",
-            "description": "Controls browser: close tab, close window, go back, forward, refresh, scroll, play/pause video.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "close_tab",
-                            "close_window",
-                            "back",
-                            "forward",
-                            "refresh",
-                            "new_tab",
-                            "scroll_down",
-                            "scroll_up",
-                            "fullscreen",
-                            "toggle_media"
-                        ]
-                    }
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "browser_click_link",
-            "description": "Clicks a link, button, or search result by position ('first link', 'second video') or visible text label in the browser.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "target": {"type": "string", "description": "e.g. 'first link', 'second video', 'Shorts'"}
-                },
-                "required": ["target"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "start_gmail_login",
-            "description": "Opens Gmail login page and begins guided sign-in.",
-            "parameters": {"type": "object", "properties": {}}
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "Searches YouTube or Google. Set platform='youtube' when query relates to videos, music, or songs.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "Search query keywords"},
-                    "platform": {"type": "string", "enum": ["youtube", "google", "auto"]}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "launch_app",
-            "description": "Launches applications (e.g. files, text editor, terminal, chrome).",
-            "parameters": {
-                "type": "object",
-                "properties": {"app_name": {"type": "string"}},
-                "required": ["app_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "close_application",
-            "description": "Closes an entire desktop application or process window cleanly.",
-            "parameters": {
-                "type": "object",
-                "properties": {"app_name": {"type": "string"}},
-                "required": ["app_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
             "name": "set_system_volume",
-            "description": "Adjusts or sets master volume level.",
+            "description": "Adjusts speaker audio volume.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -997,98 +690,148 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "open_local_file",
-            "description": "Opens a document or code file in editor.",
+            "name": "open_folder",
+            "description": "Opens folders, nested subfolders (e.g. 'screenshots', 'open new folder in documents').",
             "parameters": {
                 "type": "object",
-                "properties": {"filepath": {"type": "string"}},
-                "required": ["filepath"]
+                "properties": {
+                    "folder_name": {"type": "string", "description": "Target folder name, e.g. 'screenshots', 'new folder'"},
+                    "subfolder_of": {"type": "string", "description": "Parent directory if specified, e.g. 'documents'"}
+                },
+                "required": ["folder_name"]
             }
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "get_storage_status",
-            "description": "Checks free hard disk drive space.",
+            "name": "open_file_anywhere",
+            "description": "Finds and opens any image, PNG, PDF, or document (e.g. 'open 1.png', 'open report.pdf').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "filename": {"type": "string", "description": "Name of the file, e.g. '1.png'"},
+                    "folder": {"type": "string", "description": "Optional directory location, e.g. 'screenshots'"}
+                },
+                "required": ["filename"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_file_or_folder",
+            "description": "Finds files matching names or large files exceeding size (e.g. 'find files greater than 100mb', 'find pass.txt').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string"},
+                    "min_size_mb": {"type": "number", "description": "Size threshold in megabytes"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files_by_type_or_state",
+            "description": "Lists files by format or reveals hidden files (e.g. 'list all pdfs', 'list images', 'open hidden files', 'show hidden files').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_type": {"type": "string", "enum": ["all", "pdf", "images", "video", "document"]},
+                    "directory": {"type": "string"},
+                    "include_hidden": {"type": "boolean"}
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_disk_usage_and_clean_advice",
+            "description": "Shows disk space usage and suggests unnecessary files/caches to clean.",
             "parameters": {"type": "object", "properties": {}}
         }
     },
     {
         "type": "function",
         "function": {
-            "name": "get_battery_status",
-            "description": "Reads laptop battery level.",
+            "name": "get_current_time_and_date",
+            "description": "Gets current time and date.",
             "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "empty_trash",
+            "description": "Empties trash bin.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "open_trash",
+            "description": "Opens trash bin folder.",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "launch_app",
+            "description": "Launches apps (firefox, terminal, text editor, settings).",
+            "parameters": {
+                "type": "object",
+                "properties": {"app_name": {"type": "string"}},
+                "required": ["app_name"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Searches Google or YouTube.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"]
+            }
         }
     }
 ]
 
-# ==========================================
-# 4. LLM INFERENCE (MULTI-TOOL ENABLED)
-# ==========================================
 SYSTEM_PROMPT = (
     "You are Jarvis, an autonomous desktop assistant running natively on Linux. "
     "Rules:\n"
     "1. Respond in strictly 1 short sentence.\n"
-    "2. NEVER output raw Python function calls or text like 'delete_file_or_folder(...)' into content. "
-    "You MUST invoke actions via the provided tool_calls mechanism.\n"
-    "3. FILE MANAGEMENT:\n"
-    "   - When asked to delete all files in a folder (e.g. 'delete all files in downloads'), "
-    "call 'delete_file_or_folder' with target='~/Downloads/*'.\n"
-    "   - To delete a single file/folder, call 'delete_file_or_folder' with the target path.\n"
-    "   - To move a file/folder, call 'move_file_or_folder' with source and destination.\n"
-    "   - To copy a file/folder, call 'copy_file_or_folder' with source and destination.\n"
-    "4. DIRECTORIES & FOLDERS:\n"
-    "   - When asked to open a folder like 'open documents', 'open downloads', call 'open_folder'.\n"
-    "   - When asked to click or select an item inside the file manager, call 'select_item_in_file_manager'.\n"
-    "5. MULTI-COMMAND EXECUTION: When the user asks to perform multiple tasks in one sentence, "
-    "call EVERY necessary tool in your tool_calls response list.\n"
-    "6. For asking about current time or date, call 'get_current_time_and_date'.\n"
-    "7. If the user asks to list files, call list_directory_files.\n"
-    "8. If the user asks to execute/run a bash command, call run_terminal_command.\n"
-    "9. If the user asks to type into a website, call type_query_into_site.\n"
-    "10. For closing a tab, call browser_action with action='close_tab'. For going back, action='back'.\n"
-    "11. For playing/pausing media, call browser_action with action='toggle_media'.\n"
-    "12. For general apps (browser, terminal, text editor), call launch_app; to terminate whole apps, call close_application."
+    "2. GENERAL KNOWLEDGE: If the user asks a factual question (e.g. 'who is Charles Babbage', 'what is photosynthesis', 'why is the sky blue'), DO NOT search Google or open a browser. Directly explain it concisely in 1 sentence.\n"
+    "3. NEVER output raw syntax like function_name(arg=val). Use tool_calls.\n"
+    "4. BRIGHTNESS: For 'increase the brightness', 'set brightness to 100%', call set_system_brightness. Do NOT confuse brightness with volume.\n"
+    "5. FOLDERS: For 'open screenshots folder', call open_folder(folder_name='screenshots'). For 'open new folder in documents', call open_folder(folder_name='new folder', subfolder_of='documents').\n"
+    "6. OPENING FILES: For 'open 1.png', 'open sample.pdf', call open_file_anywhere.\n"
+    "7. LISTING & SEARCH: For 'list pdfs', call list_files_by_type_or_state(file_type='pdf'). For 'open hidden files' or 'list hidden files', call list_files_by_type_or_state(include_hidden=True). For 'find files greater than 100mb', call find_file_or_folder with min_size_mb=100.\n"
+    "8. DISK USAGE & CLEANUP: For 'show disk usage' or 'help clean space', call get_disk_usage_and_clean_advice."
 )
 
 def query_llm(prompt: str) -> str:
-    print(f"\n[Interpreting Intent]: {prompt}")
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": prompt}
-    ]
+    emit_status("STATE", "THINKING")
+    emit_status("LOG", f"Prompt: {prompt}")
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}]
     try:
         response = ollama.chat(model=LLM_MODEL, messages=messages, tools=TOOL_SCHEMAS)
         msg = response.get("message", {})
-        
         tool_calls = msg.get("tool_calls", [])
-        
-        # Fallback regex parser if the local model outputs text instead of structured tool_calls
-        content = msg.get("content", "").strip()
-        if not tool_calls and content:
-            m = re.match(r'(\w+)\((.*)\)', content, re.DOTALL)
-            if m:
-                func_name = m.group(1)
-                args_str = m.group(2)
-                if func_name in AVAILABLE_TOOLS:
-                    parsed_args = {}
-                    for match in re.finditer(r'(\w+)=["\']([^"\']*)["\']', args_str):
-                        parsed_args[match.group(1)] = match.group(2)
-                    tool_calls = [{
-                        "function": {
-                            "name": func_name,
-                            "arguments": parsed_args
-                        }
-                    }]
 
         if tool_calls:
             results = []
             for tc in tool_calls:
                 name = tc["function"]["name"]
                 args = tc["function"]["arguments"]
-                print(f"[Executing Tool Call]: {name}({args})")
+                emit_status("LOG", f"Tool: {name}")
                 if name in AVAILABLE_TOOLS:
                     try:
                         res = AVAILABLE_TOOLS[name](**args)
@@ -1096,16 +839,13 @@ def query_llm(prompt: str) -> str:
                             results.append(str(res))
                     except Exception as err:
                         results.append(f"Error on {name}: {str(err)}")
-            if results:
-                return " and ".join(results) + "."
-            return "Executed requested actions."
-            
-        return content if content else "Understood."
+            return " and ".join(results) + "." if results else "Done."
+        return msg.get("content", "Understood.")
     except Exception as e:
         return f"Error: {str(e)}"
 
 # ==========================================
-# 5. AUDIO TRANSCRIPTION & CAPTURE
+# 6. AUDIO & SOCKET SERVER
 # ==========================================
 def transcribe_audio_data(audio_bytes: bytes) -> str:
     mono_16k = convert_to_16k_mono(audio_bytes)
@@ -1115,192 +855,92 @@ def transcribe_audio_data(audio_bytes: bytes) -> str:
         wf.setsampwidth(2)
         wf.setframerate(16000)
         wf.writeframes(mono_16k)
-        
-    segments, _ = stt_model.transcribe(
-        temp_wav,
-        beam_size=2,
-        initial_prompt="Hey Jarvis, delete all files in downloads, move pass.txt, open documents, click snap, copy, delete."
-    )
+
+    segments, _ = stt_model.transcribe(temp_wav, beam_size=2)
     return " ".join([s.text for s in segments]).strip().lower()
 
-def check_for_barge_in(stream, trigger_thresh: int, silence_thresh: int) -> str:
-    """Listens during inter-sentence pause for spoken interruptions."""
-    check_chunks = int((RATE / CHUNK_SIZE) * 0.35)
-    for _ in range(check_chunks):
-        if INTERRUPT_REQUESTED:
-            return ""
-        chunk = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-        energy = int(np.abs(np.frombuffer(chunk, dtype=np.int16)).mean())
-        if energy > trigger_thresh:
-            print(f"\n[Interruption Detected - Energy: {energy}] Listening to new command...", flush=True)
-            recorded = [chunk]
-            silent_count = 0
-            silence_limit = int((RATE / CHUNK_SIZE) * 0.8)
-            max_rec = int((RATE / CHUNK_SIZE) * 5)
-            while len(recorded) < max_rec:
-                if INTERRUPT_REQUESTED:
-                    return ""
-                c = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                recorded.append(c)
-                if int(np.abs(np.frombuffer(c, dtype=np.int16)).mean()) < silence_thresh:
-                    silent_count += 1
-                else:
-                    silent_count = 0
-                if len(recorded) > int((RATE / CHUNK_SIZE) * 0.6) and silent_count > silence_limit:
-                    break
-            return transcribe_audio_data(b"".join(recorded))
-    return ""
+def handle_command(text: str):
+    emit_status("LOG", f"Executing: {text}")
+    reply = query_llm(text)
+    play_single_sentence(reply)
 
-def speak_with_interruption(text: str, stream, trigger_thresh: int, silence_thresh: int):
-    """Streams sentences sequentially and listens for Enter key or spoken interruptions."""
-    global INTERRUPT_REQUESTED
-    INTERRUPT_REQUESTED = False
+def client_handler(conn):
+    global RECORDING_ACTIVE, AUDIO_FRAMES
+    with CLIENT_LOCK:
+        CONNECTED_CLIENTS.append(conn)
+    buffer = ""
+    try:
+        while True:
+            data = conn.recv(1024)
+            if not data:
+                break
+            buffer += data.decode("utf-8")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                cmd = line.strip()
+                if cmd == "SKIP_SPEECH":
+                    stop_playback()
+                elif cmd == "START_PTT":
+                    AUDIO_FRAMES = []
+                    RECORDING_ACTIVE = True
+                    emit_status("STATE", "RECORDING")
+                elif cmd == "STOP_PTT":
+                    RECORDING_ACTIVE = False
+                    emit_status("STATE", "THINKING")
+                    if AUDIO_FRAMES:
+                        text = transcribe_audio_data(b"".join(AUDIO_FRAMES))
+                        if len(text.strip()) >= 2:
+                            handle_command(text)
+                    emit_status("STATE", "STANDBY")
+                elif cmd:
+                    if IS_SPEAKING:
+                        stop_playback()
+                    handle_command(cmd)
+    except Exception:
+        pass
+    finally:
+        with CLIENT_LOCK:
+            if conn in CONNECTED_CLIENTS:
+                CONNECTED_CLIENTS.remove(conn)
+        conn.close()
 
-    print(f"\n[Jarvis Voice]: {text}")
-    print("[Tip]: Press [Enter] anytime to immediately skip speaking.")
-    sentences = re.split(r'(?<=[.!?]) +', text)
-
-    for i, s in enumerate(sentences):
-        if INTERRUPT_REQUESTED:
+def socket_server_thread():
+    if os.path.exists(SOCKET_PATH):
+        try:
+            os.remove(SOCKET_PATH)
+        except Exception:
+            pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(SOCKET_PATH)
+    server.listen(5)
+    os.chmod(SOCKET_PATH, 0o777)
+    while True:
+        try:
+            conn, _ = server.accept()
+            threading.Thread(target=client_handler, args=(conn,), daemon=True).start()
+        except Exception:
             break
 
-        play_single_sentence(s)
-
-        if i < len(sentences) - 1:
-            heard = check_for_barge_in(stream, trigger_thresh, silence_thresh)
-            if heard:
-                print(f"[Interrupted With]: \"{heard}\"")
-                stop_playback()
-                stop_words = ["stop", "shut up", "okay", "got it", "quiet", "cancel", "thanks"]
-                if not any(w in heard for w in stop_words):
-                    handle_command(heard, stream, trigger_thresh, silence_thresh)
-                return
-
-# ==========================================
-# 6. MAIN ENGINE & CONTEXT DISPATCHER
-# ==========================================
-def handle_command(text: str, stream, trigger_thresh: int, silence_thresh: int):
-    global PENDING_ACTION
-
-    if PENDING_ACTION:
-        state = PENDING_ACTION.get("state")
-        
-        if state == "waiting_email":
-            email_val = text.replace(" at ", "@").replace(" dot ", ".").replace(" ", "").strip()
-            print(f"[Gmail Flow] Entering Account: {email_val}")
-            enter_browser_text(email_val, press_enter=True)
-            PENDING_ACTION = {"state": "waiting_password"}
-            speak_with_interruption("Account entered. What is your password?", stream, trigger_thresh, silence_thresh)
-            return
-
-        elif state == "waiting_password":
-            pwd_val = text.replace(" ", "").strip()
-            print("[Gmail Flow] Entering Password...")
-            enter_browser_text(pwd_val, press_enter=True)
-            PENDING_ACTION = None
-            speak_with_interruption("Password entered. You are logging in.", stream, trigger_thresh, silence_thresh)
-            return
-
-    wake_words = ["hey jarvis", "jarvis", "jazza", "jollis", "travis"]
-    action_starters = [
-        "delete", "remove", "trash", "clear", "clean",
-        "documents", "downloads", "pictures", "desktop", "music", "videos",
-        "move", "copy",
-        "time", "date", "day", "today", "clock",
-        "execute", "run", "list", "ls", "dir", "show",
-        "open", "close", "click", "set", "turn", "search",
-        "what", "how", "storage", "battery", "tell", "explain", "who", "why",
-        "go", "play", "pause", "resume", "login", "log in", "scroll", "refresh", "reload", "type"
-    ]
-
-    has_wake = any(w in text for w in wake_words)
-    has_action = any(text.startswith(act) for act in action_starters)
-
-    if has_wake or has_action:
-        cmd = text
-        for w in wake_words:
-            cmd = cmd.replace(w, "").strip()
-        if len(cmd) > 1:
-            reply = query_llm(cmd)
-            speak_with_interruption(reply, stream, trigger_thresh, silence_thresh)
+threading.Thread(target=socket_server_thread, daemon=True).start()
 
 def run_jarvis():
+    global AUDIO_FRAMES
     with no_alsa_err():
         p = pyaudio.PyAudio()
-        stream = p.open(
-            format=pyaudio.paInt16,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK_SIZE
-        )
+        stream = p.open(format=pyaudio.paInt16, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK_SIZE)
 
-    print("[Calibration] Calibrating microphone (remain quiet)...")
-    energies = []
-    for _ in range(int((RATE / CHUNK_SIZE) * 1.5)):
-        data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-        energies.append(np.abs(np.frombuffer(data, dtype=np.int16)).mean())
-    
-    ambient = int(np.mean(energies))
-    trigger_thresh = ambient + 3500
-    silence_thresh = ambient + 1200
-    print(f"[Ready] Ambient: {ambient} | Trigger: {trigger_thresh} | Silence: {silence_thresh}")
-
-    play_single_sentence("Jarvis is online and ready.")
-    print("\n[System]: Listening for voice input...")
-
-    buffer = []
-    buffer_len = int((RATE / CHUNK_SIZE) * 1.2)
-    silence_limit = int((RATE / CHUNK_SIZE) * 0.9)
+    emit_status("STATE", "STANDBY")
+    emit_status("LOG", "Core Online (All Systems Ready)")
 
     try:
         while True:
             data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-
-            if IS_SPEAKING:
-                buffer.clear()
-                continue
-
-            energy = int(np.abs(np.frombuffer(data, dtype=np.int16)).mean())
-            meter = "#" * min(int(energy / 500), 25)
-            print(f"\rLevel: {energy:5d} [{meter:<25}]", end="", flush=True)
-
-            if energy > trigger_thresh:
-                print(f"\n[Voice Detected - Energy: {energy}] Recording...", flush=True)
-                frames = []
-                silent_count = 0
-                max_frames = int((RATE / CHUNK_SIZE) * 6)
-
-                while len(frames) < max_frames:
-                    chunk = stream.read(CHUNK_SIZE, exception_on_overflow=False)
-                    frames.append(chunk)
-                    chunk_energy = np.abs(np.frombuffer(chunk, dtype=np.int16)).mean()
-                    if chunk_energy < silence_thresh:
-                        silent_count += 1
-                    else:
-                        silent_count = 0
-                    if len(frames) > int((RATE / CHUNK_SIZE) * 0.8) and silent_count > silence_limit:
-                        break
-
-                full_audio = b"".join(buffer) + b"".join(frames)
-                buffer.clear()
-
-                text = transcribe_audio_data(full_audio)
-                print(f"[Heard]: \"{text}\"")
-
-                if len(text.strip()) >= 2:
-                    handle_command(text, stream, trigger_thresh, silence_thresh)
-
-                print("\n[System]: Listening...")
-
+            if RECORDING_ACTIVE:
+                AUDIO_FRAMES.append(data)
             else:
-                buffer.append(data)
-                if len(buffer) > buffer_len:
-                    buffer.pop(0)
-
+                time.sleep(0.01)
     except KeyboardInterrupt:
         stop_playback()
-        print("\nShutting down Jarvis...")
     finally:
         stream.stop_stream()
         stream.close()
