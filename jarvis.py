@@ -7,11 +7,12 @@ import shutil
 import wave
 import signal
 import socket
+import hashlib
 import threading
 import subprocess
 import urllib.parse
 import contextlib
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -53,8 +54,9 @@ CHANNELS = 2
 CHUNK_SIZE = 2048
 
 IS_SPEAKING = False
-CURRENT_PROC = None
-PROC_LOCK = threading.Lock()
+SKIP_REQUESTED = threading.Event()
+CURRENT_AUDIO_PROC = None
+AUDIO_LOCK = threading.Lock()
 
 RECORDING_ACTIVE = False
 AUDIO_FRAMES = []
@@ -84,7 +86,7 @@ def emit_status(status_type: str, message: str):
                 CONNECTED_CLIENTS.remove(d)
 
 # ==========================================
-# 3. ROBUST AUDIO DSP & INSTANT SKIP
+# 3. NON-BLOCKING AUDIO DSP & INSTANT SKIP
 # ==========================================
 def convert_to_16k_mono(raw_bytes: bytes) -> bytes:
     audio = np.frombuffer(raw_bytes, dtype=np.int16)
@@ -92,46 +94,62 @@ def convert_to_16k_mono(raw_bytes: bytes) -> bytes:
     return mono[::3].tobytes()
 
 def stop_playback():
-    """Instantly kills Piper and audio playback."""
-    global CURRENT_PROC, IS_SPEAKING
-    with PROC_LOCK:
-        if CURRENT_PROC is not None:
+    global CURRENT_AUDIO_PROC, IS_SPEAKING
+    SKIP_REQUESTED.set()
+    with AUDIO_LOCK:
+        if CURRENT_AUDIO_PROC is not None:
             try:
-                os.killpg(os.getpgid(CURRENT_PROC.pid), signal.SIGKILL)
+                os.killpg(os.getpgid(CURRENT_AUDIO_PROC.pid), signal.SIGKILL)
             except Exception:
                 pass
-            CURRENT_PROC = None
-    subprocess.run(["pkill", "-9", "-f", "aplay -r 22050"], capture_output=True)
+            CURRENT_AUDIO_PROC = None
+    subprocess.run(["pkill", "-9", "-f", "aplay"], capture_output=True)
+    subprocess.run(["pkill", "-9", "-f", "piper"], capture_output=True)
     IS_SPEAKING = False
     emit_status("STATE", "STANDBY")
     emit_status("LOG", "Speech skipped.")
 
-def play_single_sentence(sentence: str) -> bool:
-    global CURRENT_PROC, IS_SPEAKING
-    clean = sentence.replace('"', '\\"').replace("'", "").replace("\n", " ").strip()
-    if not clean:
-        return True
-
+def play_text_response(text: str):
+    global CURRENT_AUDIO_PROC, IS_SPEAKING
+    SKIP_REQUESTED.clear()
     IS_SPEAKING = True
-    emit_status("STATE", "SPEAKING")
-    emit_status("LOG", f"Speaking: {clean}")
 
-    piper_cmd = f'echo "{clean}" | piper --model {PIPER_MODEL} --config {PIPER_CONFIG} --output-raw | aplay -r 22050 -f S16_LE -t raw -q'
-    proc = subprocess.Popen(piper_cmd, shell=True, preexec_fn=os.setsid)
-    with PROC_LOCK:
-        CURRENT_PROC = proc
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    for s in sentences:
+        if SKIP_REQUESTED.is_set():
+            break
 
-    proc.wait()
-    with PROC_LOCK:
-        CURRENT_PROC = None
+        clean = s.replace('"', '\\"').replace("'", "").replace("\n", " ").strip()
+        if not clean:
+            continue
 
-    time.sleep(0.06)
+        emit_status("STATE", "SPEAKING")
+        emit_status("LOG", f"Speaking: {clean}")
+
+        cmd = f'echo "{clean}" | piper --model {PIPER_MODEL} --config {PIPER_CONFIG} --output-raw | aplay -r 22050 -f S16_LE -t raw -q'
+        with AUDIO_LOCK:
+            if SKIP_REQUESTED.is_set():
+                break
+            proc = subprocess.Popen(cmd, shell=True, preexec_fn=os.setsid)
+            CURRENT_AUDIO_PROC = proc
+
+        while proc.poll() is None:
+            if SKIP_REQUESTED.is_set():
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    pass
+                break
+            time.sleep(0.02)
+
+        with AUDIO_LOCK:
+            CURRENT_AUDIO_PROC = None
+
     IS_SPEAKING = False
     emit_status("STATE", "STANDBY")
-    return True
 
 # ==========================================
-# 4. ALL FUNCTION DEFINITIONS (ORDERED FIRST)
+# 4. SYSTEM ENVIRONMENT & UTILITIES
 # ==========================================
 def get_desktop_env():
     env = os.environ.copy()
@@ -180,56 +198,236 @@ def resolve_system_path(raw_path: str) -> Path:
 
     return expanded.resolve()
 
-def launch_app(app_name: str):
-    """Launches desktop applications, terminals, or browsers cleanly under Wayland/systemd."""
-    clean = app_name.lower().strip()
-    env = get_desktop_env()
-
-    if clean in ["terminal", "new terminal", "terminal window", "gnome terminal", "console"]:
-        for term_bin in ["gnome-terminal --window", "ptyxis --new-window", "alacritty", "kitty", "x-terminal-emulator"]:
-            bin_name = term_bin.split()[0]
-            if shutil.which(bin_name):
-                subprocess.Popen(term_bin, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                emit_status("LOG", "Opened Terminal")
-                return "Opened a new terminal window."
-
-    if clean in ["text editor", "editor", "gedit", "gnome text editor"]:
-        for ed in ["gnome-text-editor", "gedit", "kate"]:
-            if shutil.which(ed):
-                subprocess.Popen([ed], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                emit_status("LOG", "Opened Text Editor")
-                return "Opened the text editor."
-
-    if clean in ["firefox", "browser", "chrome", "google chrome"]:
-        for br in (["firefox"] if "firefox" in clean else ["google-chrome", "chromium", "firefox", "brave-browser"]):
-            if shutil.which(br):
-                subprocess.Popen([br], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                emit_status("LOG", f"Opened {br.title()}")
-                return f"Opened {br.title()}."
-
-    if clean in ["files", "file manager"]:
-        return open_folder("home")
-
-    if clean in ["trash", "trash bin", "rubbish"]:
-        return open_trash()
-
-    app_map = {
-        "app center": ["snap-store", "ubuntu-app-center", "gnome-software"],
-        "calculator": ["gnome-calculator"], "settings": ["gnome-control-center"],
-        "code": ["code"]
+# ==========================================
+# 5. GNOME SETTINGS DEEP-LINKING
+# ==========================================
+def open_settings_panel(panel: str = "default"):
+    """Opens specific GNOME control center settings panels."""
+    clean = panel.lower().strip()
+    panel_map = {
+        "brightness": "display",
+        "display": "display",
+        "wifi": "wifi",
+        "network": "network",
+        "bluetooth": "bluetooth",
+        "sound": "sound",
+        "audio": "sound",
+        "keyboard": "keyboard",
+        "mouse": "mouse",
+        "touchpad": "mouse",
+        "power": "power",
+        "battery": "power",
+        "privacy": "privacy",
+        "appearance": "background",
+        "wallpaper": "background",
+        "background": "background",
+        "language": "region",
+        "region": "region",
+        "date": "datetime",
+        "time": "datetime",
+        "datetime": "datetime",
+        "notifications": "notifications",
+        "accessibility": "universal-access",
+        "universal-access": "universal-access"
     }
-    candidates = app_map.get(clean, [clean])
-    for c in candidates:
-        if subprocess.run(["gtk-launch", c], env=env, capture_output=True).returncode == 0:
-            emit_status("LOG", f"Launched: {app_name}")
-            return f"Opened {app_name}."
-        if shutil.which(c):
-            subprocess.Popen([c], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            emit_status("LOG", f"Launched: {app_name}")
-            return f"Opened {app_name}."
+    target_panel = panel_map.get(clean, clean if clean != "default" else "")
+    env = get_desktop_env()
+    emit_status("LOG", f"Opening {target_panel or 'system'} settings...")
 
-    return f"Could not find application '{app_name}'."
+    cmd = ["gnome-control-center"]
+    if target_panel:
+        cmd.append(target_panel)
 
+    try:
+        subprocess.Popen(cmd, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return f"Opened {panel} settings."
+    except Exception as e:
+        return f"Failed to open settings: {str(e)}"
+
+# ==========================================
+# 6. ENHANCED BRIGHTNESS ENGINE
+# ==========================================
+def set_system_brightness(percent: int = None, delta: int = None, mode: str = None):
+    """Controls screen brightness explicitly using intel_backlight."""
+    emit_status("LOG", "Adjusting screen brightness...")
+
+    # Calculate target
+    if mode:
+        m = mode.lower().strip()
+        if any(k in m for k in ["max", "full", "100"]):
+            arg = "100%"
+            disp = "100%"
+        elif any(k in m for k in ["min", "minimum", "low"]):
+            arg = "10%"
+            disp = "10%"
+        elif any(k in m for k in ["increase", "raise", "brighten", "up"]):
+            arg = "20%+"
+            disp = "+20%"
+        elif any(k in m for k in ["decrease", "lower", "dim", "down"]):
+            arg = "20%-"
+            disp = "-20%"
+        else:
+            arg = "50%"
+            disp = "50%"
+    elif delta is not None:
+        sign = "+" if delta > 0 else "-"
+        arg = f"{abs(delta)}%{sign}"
+        disp = f"{delta:+d}%"
+    elif percent is not None:
+        pct = max(1, min(100, int(percent)))
+        arg = f"{pct}%"
+        disp = f"{pct}%"
+    else:
+        arg = "50%"
+        disp = "50%"
+
+    res = subprocess.run(
+        ["brightnessctl", "-d", "intel_backlight", "set", arg],
+        capture_output=True,
+        text=True
+    )
+
+    if res.returncode == 0:
+        emit_status("LOG", f"Brightness adjusted: {disp}")
+        return f"Brightness adjusted to {disp}."
+    else:
+        err = res.stderr.strip() or res.stdout.strip()
+        emit_status("LOG", f"Brightness error: {err}")
+        return f"Failed to set brightness: {err}" #==========================================
+# 7. ADVANCED FILE & DIAGNOSTIC SEARCH
+# ==========================================
+def advanced_file_search(query_type: str, search_dir: str = "~", extra_arg: str = None):
+    """Deep file discovery: empty files/folders, symlinks, executables, recent edits, duplicates, grep."""
+    base = resolve_system_path(search_dir)
+    emit_status("LOG", f"Running diagnostic scan: {query_type}...")
+    results = []
+
+    scan_dirs = [base] if base != Path.home() else [
+        Path.home() / "Documents", Path.home() / "Downloads",
+        Path.home() / "Desktop", Path.home() / "Pictures", Path.home()
+    ]
+
+    now = datetime.now()
+
+    try:
+        if query_type == "empty_files":
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_file() and p.stat().st_size == 0 and not any(part.startswith(".") for part in p.parts):
+                        results.append(f"{p.name} ({p.parent.name})")
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "empty_folders":
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_dir() and not any(part.startswith(".") for part in p.parts):
+                        try:
+                            if not any(p.iterdir()):
+                                results.append(f"{p.name}/ ({p.parent.name})")
+                                if len(results) >= 8: break
+                        except PermissionError:
+                            continue
+                if len(results) >= 8: break
+
+        elif query_type == "broken_symlinks":
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_symlink() and not p.exists():
+                        results.append(f"{p.name} -> broken target")
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "executable_files":
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_file() and os.access(p, os.X_OK) and not any(part.startswith(".") for part in p.parts):
+                        results.append(p.name)
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "modified_today":
+            today_start = datetime(now.year, now.month, now.day).timestamp()
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_file() and p.stat().st_mtime >= today_start and not any(part.startswith(".") for part in p.parts):
+                        results.append(p.name)
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "modified_last_7_days":
+            cutoff = (now - timedelta(days=7)).timestamp()
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_file() and p.stat().st_mtime >= cutoff and not any(part.startswith(".") for part in p.parts):
+                        results.append(p.name)
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "log_files":
+            for d in scan_dirs:
+                for p in d.rglob("*.log"):
+                    if not any(part.startswith(".") for part in p.parts):
+                        results.append(p.name)
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "python_files":
+            for d in scan_dirs:
+                for p in d.rglob("*.py"):
+                    if not any(part.startswith(".") for part in p.parts):
+                        results.append(p.name)
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "readme_files":
+            for d in scan_dirs:
+                for p in d.rglob("*README*"):
+                    if not any(part.startswith(".") for part in p.parts):
+                        results.append(f"{p.name} ({p.parent.name})")
+                        if len(results) >= 8: break
+                if len(results) >= 8: break
+
+        elif query_type == "duplicate_files":
+            seen_hashes = {}
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_file() and 0 < p.stat().st_size < (50 * 1024 * 1024) and not any(part.startswith(".") for part in p.parts):
+                        try:
+                            file_hash = hashlib.md5(p.read_bytes()[:65536]).hexdigest()
+                            if file_hash in seen_hashes:
+                                results.append(f"{p.name} (duplicate of {seen_hashes[file_hash]})")
+                                if len(results) >= 6: break
+                            else:
+                                seen_hashes[file_hash] = p.name
+                        except Exception:
+                            continue
+                if len(results) >= 6: break
+
+        elif query_type == "grep_text":
+            pattern = extra_arg or "TODO"
+            for d in scan_dirs:
+                for p in d.rglob("*"):
+                    if p.is_file() and p.stat().st_size < (5 * 1024 * 1024) and not any(part.startswith(".") for part in p.parts):
+                        try:
+                            if pattern in p.read_text(errors="ignore"):
+                                results.append(p.name)
+                                if len(results) >= 8: break
+                        except Exception:
+                            continue
+                if len(results) >= 8: break
+
+    except Exception as e:
+        return f"Scan failed: {str(e)}"
+
+    if results:
+        emit_status("LOG", f"Scan found {len(results)} matches.")
+        return f"Found matches: {', '.join(results)}."
+    return f"No matching files found for {query_type.replace('_', ' ')}."
+
+# ==========================================
+# 8. STANDARD CORE TOOLS
+# ==========================================
 def set_system_volume(percent: int = None, delta: int = None):
     try:
         subprocess.run("wpctl set-mute @DEFAULT_AUDIO_SINK@ 0 2>/dev/null || pactl set-sink-mute @DEFAULT_SINK@ 0 2>/dev/null", shell=True)
@@ -248,32 +446,6 @@ def set_system_volume(percent: int = None, delta: int = None):
     except Exception as e:
         return f"Failed to change volume: {str(e)}"
     return "Volume command not understood."
-
-def set_system_brightness(percent: int = None, delta: int = None):
-    emit_status("LOG", "Adjusting screen brightness...")
-    try:
-        if not shutil.which("brightnessctl"):
-            return "brightnessctl is not installed. Please run: sudo apt install brightnessctl"
-        if delta is not None:
-            sign = "+" if delta > 0 else "-"
-            subprocess.run(["brightnessctl", "set", f"{abs(delta)}%{sign}"], capture_output=True)
-            emit_status("LOG", f"Brightness: {delta:+d}%")
-            return f"Brightness adjusted by {delta} percent."
-        if percent is not None:
-            pct = max(1, min(100, int(percent)))
-            subprocess.run(["brightnessctl", "set", f"{pct}%"], capture_output=True)
-            emit_status("LOG", f"Brightness: {pct}%")
-            return f"Brightness set to {pct} percent."
-    except Exception as e:
-        return f"Failed to set brightness: {str(e)}"
-    return "Brightness command not understood."
-
-def get_current_time_and_date():
-    now = datetime.now()
-    time_str = now.strftime("%I:%M %p").lstrip('0')
-    date_str = now.strftime("%A, %B %d, %Y")
-    emit_status("LOG", f"Time checked: {time_str}")
-    return f"The current time is {time_str}, and today is {date_str}."
 
 def open_folder(folder_name: str = "home", subfolder_of: str = None):
     clean = folder_name.lower().strip() if folder_name else "home"
@@ -298,7 +470,7 @@ def open_folder(folder_name: str = "home", subfolder_of: str = None):
 def open_file_anywhere(filename: str, folder: str = None):
     clean_name = filename.strip().strip("'\"")
     env = get_desktop_env()
-    emit_status("LOG", f"Locating and opening '{clean_name}'...")
+    emit_status("LOG", f"Locating '{clean_name}'...")
 
     target_path = None
     if folder:
@@ -322,7 +494,7 @@ def open_file_anywhere(filename: str, folder: str = None):
         subprocess.Popen(["xdg-open", str(target_path)], env=env)
         emit_status("LOG", f"Opened file: {target_path.name}")
         return f"Opened {target_path.name}."
-    return f"Could not find '{clean_name}' to open."
+    return f"Could not find '{clean_name}'."
 
 def find_file_or_folder(target: str = "", min_size_mb: float = None, search_dir: str = "~"):
     clean = target.strip().strip("'\"") if target else ""
@@ -533,6 +705,55 @@ def close_application(app_name: str):
     emit_status("LOG", f"Closed: {app_name}")
     return f"Closed {app_name}."
 
+def launch_app(app_name: str):
+    clean = app_name.lower().strip()
+    env = get_desktop_env()
+
+    if clean in ["terminal", "new terminal", "terminal window", "gnome terminal", "console"]:
+        for term_bin in ["gnome-terminal --window", "ptyxis --new-window", "alacritty", "kitty", "x-terminal-emulator"]:
+            bin_name = term_bin.split()[0]
+            if shutil.which(bin_name):
+                subprocess.Popen(term_bin, shell=True, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                emit_status("LOG", "Opened Terminal")
+                return "Opened a new terminal window."
+
+    if clean in ["text editor", "editor", "gedit", "gnome text editor"]:
+        for ed in ["gnome-text-editor", "gedit", "kate"]:
+            if shutil.which(ed):
+                subprocess.Popen([ed], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                emit_status("LOG", "Opened Text Editor")
+                return "Opened the text editor."
+
+    if clean in ["firefox", "browser", "chrome", "google chrome"]:
+        for br in (["firefox"] if "firefox" in clean else ["google-chrome", "chromium", "firefox", "brave-browser"]):
+            if shutil.which(br):
+                subprocess.Popen([br], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                emit_status("LOG", f"Opened {br.title()}")
+                return f"Opened {br.title()}."
+
+    if clean in ["files", "file manager"]:
+        return open_folder("home")
+
+    if clean in ["trash", "trash bin", "rubbish"]:
+        return open_trash()
+
+    app_map = {
+        "app center": ["snap-store", "ubuntu-app-center", "gnome-software"],
+        "calculator": ["gnome-calculator"], "settings": ["gnome-control-center"],
+        "code": ["code"]
+    }
+    candidates = app_map.get(clean, [clean])
+    for c in candidates:
+        if subprocess.run(["gtk-launch", c], env=env, capture_output=True).returncode == 0:
+            emit_status("LOG", f"Launched: {app_name}")
+            return f"Opened {app_name}."
+        if shutil.which(c):
+            subprocess.Popen([c], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            emit_status("LOG", f"Launched: {app_name}")
+            return f"Opened {app_name}."
+
+    return f"Could not find application '{app_name}'."
+
 def web_search(query: str, platform: str = "auto"):
     q_clean = query.lower().strip()
     if q_clean in ["youtube", "open youtube"]:
@@ -550,96 +771,21 @@ def web_search(query: str, platform: str = "auto"):
     emit_status("LOG", f"Searched: {query}")
     return f"Searching for '{query}'."
 
-def generate_and_save_code(filename: str, language: str, description: str, folder: str = "Desktop"):
-    target_folder = resolve_system_path(folder)
-    target_folder.mkdir(parents=True, exist_ok=True)
-    file_path = target_folder / filename
-
-    emit_status("LOG", f"Generating {language} code for {filename}...")
-    prompt = f"Write complete, production-ready {language} code for: {description}. Return ONLY the raw code without markdown backticks or conversational explanations."
-    try:
-        res = ollama.chat(model=LLM_MODEL, messages=[{"role": "user", "content": prompt}])
-        raw_code = res.get("message", {}).get("content", "")
-        cleaned_code = re.sub(r"^```[\w]*\n", "", raw_code, flags=re.MULTILINE)
-        cleaned_code = re.sub(r"```$", "", cleaned_code, flags=re.MULTILINE).strip()
-
-        with open(file_path, "w", encoding="utf-8") as f:
-            f.write(cleaned_code)
-
-        emit_status("LOG", f"Saved: {file_path.name} in {target_folder.name}")
-        return f"Generated {language} program and saved it as {filename} in {target_folder.name}."
-    except Exception as e:
-        return f"Failed to generate code: {str(e)}"
-
-def execute_code_file(filename: str, folder: str = None, interactive: bool = True):
-    file_path = None
-    if folder:
-        f_dir = resolve_system_path(folder)
-        if (f_dir / filename).exists():
-            file_path = f_dir / filename
-
-    if not file_path:
-        for sub in [Path.home() / "Desktop", Path.home() / "Documents", Path.home() / "Downloads", Path.home()]:
-            if (sub / filename).exists():
-                file_path = sub / filename
-                break
-
-    if not file_path or not file_path.exists():
-        return f"File '{filename}' not found for execution."
-
-    emit_status("LOG", f"Executing: {file_path.name}...")
-    ext = file_path.suffix.lower()
-    env = get_desktop_env()
-
-    if ext == ".py":
-        interp = "python3"
-    elif ext == ".sh":
-        interp = "bash"
-    elif ext in [".js", ".mjs"]:
-        interp = "node"
-    elif ext == ".go":
-        interp = "go run"
-    else:
-        interp = "xdg-open"
-
-    needs_interactive = interactive
-    try:
-        content = file_path.read_text(encoding="utf-8", errors="ignore")
-        if any(kw in content for kw in ["input(", "readline(", "read -p", "prompt("]):
-            needs_interactive = True
-    except Exception:
-        pass
-
-    if needs_interactive:
-        for term in ["gnome-terminal", "ptyxis", "alacritty", "kitty", "x-terminal-emulator"]:
-            if shutil.which(term):
-                if term == "gnome-terminal":
-                    cmd = f'gnome-terminal --title="{file_path.name}" -- bash -c "{interp} \\"{file_path}\\"; echo; echo \\"[Process completed. Press Enter to close]\\"; read; exec bash"'
-                else:
-                    cmd = f'{term} -e bash -c "{interp} \\"{file_path}\\"; echo; echo \\"[Process completed. Press Enter to close]\\"; read"'
-                subprocess.Popen(cmd, shell=True, env=env)
-                emit_status("LOG", f"Launched {file_path.name} in terminal window.")
-                return f"Opened and executed {file_path.name} in a new terminal window."
-
-    try:
-        run_cmd = [interp, str(file_path)] if " " not in interp else interp.split() + [str(file_path)]
-        res = subprocess.run(run_cmd, capture_output=True, text=True, timeout=12)
-        out = (res.stdout or res.stderr).strip()
-        lines = [line.strip() for line in out.splitlines() if line.strip()]
-        result_preview = ", ".join(lines) if lines else "Program executed with no output."
-        emit_status("LOG", f"Output: {result_preview}")
-        return f"Execution finished. Output: {result_preview}"
-    except subprocess.TimeoutExpired:
-        return f"Program '{filename}' timed out after 12 seconds."
-    except Exception as e:
-        return f"Failed to execute '{filename}': {str(e)}"
+def get_current_time_and_date():
+    now = datetime.now()
+    time_str = now.strftime("%I:%M %p").lstrip('0')
+    date_str = now.strftime("%A, %B %d, %Y")
+    emit_status("LOG", f"Time checked: {time_str}")
+    return f"The current time is {time_str}, and today is {date_str}."
 
 # ==========================================
-# 5. DISPATCHER & TOOL SCHEMAS
+# 9. DISPATCHER & TOOL SCHEMAS
 # ==========================================
 AVAILABLE_TOOLS = {
-    "launch_app": launch_app,
+    "open_settings_panel": open_settings_panel,
     "set_system_brightness": set_system_brightness,
+    "advanced_file_search": advanced_file_search,
+    "launch_app": launch_app,
     "set_system_volume": set_system_volume,
     "open_folder": open_folder,
     "open_file_anywhere": open_file_anywhere,
@@ -651,8 +797,6 @@ AVAILABLE_TOOLS = {
     "open_trash": open_trash,
     "copy_file_or_folder": copy_file_or_folder,
     "delete_file_or_folder": delete_file_or_folder,
-    "generate_and_save_code": generate_and_save_code,
-    "execute_code_file": execute_code_file,
     "close_application": close_application,
     "control_window_state": control_window_state,
     "web_search": web_search
@@ -662,13 +806,37 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "set_system_brightness",
-            "description": "Adjusts screen brightness/backlight (e.g. 'increase the brightness to 100%', 'dim display by 20%').",
+            "name": "open_settings_panel",
+            "description": "Opens specific system settings pages: brightness, display, wifi, network, bluetooth, sound, audio, keyboard, mouse, touchpad, power, battery, privacy, appearance, wallpaper, language, region, date, time, notifications, accessibility.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "percent": {"type": "integer", "description": "Target percentage 1-100"},
-                    "delta": {"type": "integer", "description": "Delta to increase or decrease"}
+                    "panel": {
+                        "type": "string",
+                        "enum": [
+                            "brightness", "display", "wifi", "network", "bluetooth", "sound", "audio",
+                            "keyboard", "mouse", "touchpad", "power", "battery", "privacy",
+                            "appearance", "wallpaper", "language", "region", "date", "time",
+                            "notifications", "accessibility"
+                        ],
+                        "description": "The specific settings panel name"
+                    }
+                },
+                "required": ["panel"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "set_system_brightness",
+            "description": "Adjusts screen brightness. Supports percentages (e.g. 'brightness 30', 'set brightness to 50'), relative changes ('increase brightness', 'dim the screen', 'brighten the screen'), or modes ('max brightness', 'minimum brightness').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "percent": {"type": "integer", "description": "Absolute target 1-100"},
+                    "delta": {"type": "integer", "description": "Increase or decrease amount, e.g. 20 or -20"},
+                    "mode": {"type": "string", "enum": ["max", "minimum", "increase", "decrease"], "description": "Preset mode"}
                 }
             }
         }
@@ -676,14 +844,22 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "set_system_volume",
-            "description": "Adjusts speaker audio volume.",
+            "name": "advanced_file_search",
+            "description": "Searches for diagnostic file types: empty files, empty folders, broken symlinks, executable files, modified today, modified last 7 days, log files, python files, readme files, duplicate files, or files containing text.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "percent": {"type": "integer"},
-                    "delta": {"type": "integer"}
-                }
+                    "query_type": {
+                        "type": "string",
+                        "enum": [
+                            "empty_files", "empty_folders", "broken_symlinks", "executable_files",
+                            "modified_today", "modified_last_7_days", "log_files",
+                            "python_files", "readme_files", "duplicate_files", "grep_text"
+                        ]
+                    },
+                    "extra_arg": {"type": "string", "description": "Pattern or text for grep, e.g. 'TODO'"}
+                },
+                "required": ["query_type"]
             }
         }
     },
@@ -691,12 +867,12 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "open_folder",
-            "description": "Opens folders, nested subfolders (e.g. 'screenshots', 'open new folder in documents').",
+            "description": "Opens folders or nested subfolders (e.g. 'screenshots', 'open new folder in documents').",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "folder_name": {"type": "string", "description": "Target folder name, e.g. 'screenshots', 'new folder'"},
-                    "subfolder_of": {"type": "string", "description": "Parent directory if specified, e.g. 'documents'"}
+                    "folder_name": {"type": "string"},
+                    "subfolder_of": {"type": "string"}
                 },
                 "required": ["folder_name"]
             }
@@ -706,12 +882,12 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "open_file_anywhere",
-            "description": "Finds and opens any image, PNG, PDF, or document (e.g. 'open 1.png', 'open report.pdf').",
+            "description": "Finds and opens any image, PNG, PDF, or document.",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "filename": {"type": "string", "description": "Name of the file, e.g. '1.png'"},
-                    "folder": {"type": "string", "description": "Optional directory location, e.g. 'screenshots'"}
+                    "filename": {"type": "string"},
+                    "folder": {"type": "string"}
                 },
                 "required": ["filename"]
             }
@@ -721,12 +897,12 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "find_file_or_folder",
-            "description": "Finds files matching names or large files exceeding size (e.g. 'find files greater than 100mb', 'find pass.txt').",
+            "description": "Finds files matching names or large files exceeding size threshold.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "target": {"type": "string"},
-                    "min_size_mb": {"type": "number", "description": "Size threshold in megabytes"}
+                    "min_size_mb": {"type": "number"}
                 }
             }
         }
@@ -735,7 +911,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "list_files_by_type_or_state",
-            "description": "Lists files by format or reveals hidden files (e.g. 'list all pdfs', 'list images', 'open hidden files', 'show hidden files').",
+            "description": "Lists files by format or displays hidden files.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -757,9 +933,15 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_current_time_and_date",
-            "description": "Gets current time and date.",
-            "parameters": {"type": "object", "properties": {}}
+            "name": "set_system_volume",
+            "description": "Adjusts speaker audio volume.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "percent": {"type": "integer"},
+                    "delta": {"type": "integer"}
+                }
+            }
         }
     },
     {
@@ -782,7 +964,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "launch_app",
-            "description": "Launches apps (firefox, terminal, text editor, settings).",
+            "description": "Launches apps (firefox, terminal, text editor).",
             "parameters": {
                 "type": "object",
                 "properties": {"app_name": {"type": "string"}},
@@ -808,13 +990,27 @@ SYSTEM_PROMPT = (
     "You are Jarvis, an autonomous desktop assistant running natively on Linux. "
     "Rules:\n"
     "1. Respond in strictly 1 short sentence.\n"
-    "2. GENERAL KNOWLEDGE: If the user asks a factual question (e.g. 'who is Charles Babbage', 'what is photosynthesis', 'why is the sky blue'), DO NOT search Google or open a browser. Directly explain it concisely in 1 sentence.\n"
-    "3. NEVER output raw syntax like function_name(arg=val). Use tool_calls.\n"
-    "4. BRIGHTNESS: For 'increase the brightness', 'set brightness to 100%', call set_system_brightness. Do NOT confuse brightness with volume.\n"
-    "5. FOLDERS: For 'open screenshots folder', call open_folder(folder_name='screenshots'). For 'open new folder in documents', call open_folder(folder_name='new folder', subfolder_of='documents').\n"
-    "6. OPENING FILES: For 'open 1.png', 'open sample.pdf', call open_file_anywhere.\n"
-    "7. LISTING & SEARCH: For 'list pdfs', call list_files_by_type_or_state(file_type='pdf'). For 'open hidden files' or 'list hidden files', call list_files_by_type_or_state(include_hidden=True). For 'find files greater than 100mb', call find_file_or_folder with min_size_mb=100.\n"
-    "8. DISK USAGE & CLEANUP: For 'show disk usage' or 'help clean space', call get_disk_usage_and_clean_advice."
+    "2. SETTINGS PANELS:\n"
+    "   - When asked to open any settings (e.g. 'open brightness settings', 'open wifi settings', 'open sound settings', 'open keyboard settings', 'open power settings', 'open appearance settings', 'open date settings'), call 'open_settings_panel' with the matching panel name.\n"
+    "3. BRIGHTNESS CONTROL:\n"
+    "   - For 'set brightness to 50' or 'brightness 30', call set_system_brightness(percent=...).\n"
+    "   - For 'increase brightness' or 'brighten the screen', call set_system_brightness(delta=20).\n"
+    "   - For 'decrease brightness' or 'dim the screen', call set_system_brightness(delta=-20).\n"
+    "   - For 'max brightness' or 'full brightness', call set_system_brightness(mode='max').\n"
+    "   - For 'minimum brightness', call set_system_brightness(mode='minimum').\n"
+    "4. ADVANCED SYSTEM & FILE SEARCH:\n"
+    "   - For 'find empty files', call advanced_file_search(query_type='empty_files').\n"
+    "   - For 'find empty folders', call advanced_file_search(query_type='empty_folders').\n"
+    "   - For 'find broken symlinks', call advanced_file_search(query_type='broken_symlinks').\n"
+    "   - For 'find executable files', call advanced_file_search(query_type='executable_files').\n"
+    "   - For 'find files modified today', call advanced_file_search(query_type='modified_today').\n"
+    "   - For 'find files changed in last 7 days' or 'recently modified', call advanced_file_search(query_type='modified_last_7_days').\n"
+    "   - For 'find all log files', call advanced_file_search(query_type='log_files').\n"
+    "   - For 'find all python files', call advanced_file_search(query_type='python_files').\n"
+    "   - For 'find all readme files', call advanced_file_search(query_type='readme_files').\n"
+    "   - For 'find duplicate files', call advanced_file_search(query_type='duplicate_files').\n"
+    "   - For 'find files containing TODO', call advanced_file_search(query_type='grep_text', extra_arg='TODO').\n"
+    "5. GENERAL KNOWLEDGE: Answer factual queries (e.g. 'who is Charles Babbage') directly in 1 sentence. Do NOT open Google."
 )
 
 def query_llm(prompt: str) -> str:
@@ -845,7 +1041,7 @@ def query_llm(prompt: str) -> str:
         return f"Error: {str(e)}"
 
 # ==========================================
-# 6. AUDIO & SOCKET SERVER
+# 10. AUDIO & SOCKET SERVER
 # ==========================================
 def transcribe_audio_data(audio_bytes: bytes) -> str:
     mono_16k = convert_to_16k_mono(audio_bytes)
@@ -862,7 +1058,7 @@ def transcribe_audio_data(audio_bytes: bytes) -> str:
 def handle_command(text: str):
     emit_status("LOG", f"Executing: {text}")
     reply = query_llm(text)
-    play_single_sentence(reply)
+    threading.Thread(target=play_text_response, args=(reply,), daemon=True).start()
 
 def client_handler(conn):
     global RECORDING_ACTIVE, AUDIO_FRAMES
@@ -930,7 +1126,7 @@ def run_jarvis():
         stream = p.open(format=pyaudio.paInt16, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK_SIZE)
 
     emit_status("STATE", "STANDBY")
-    emit_status("LOG", "Core Online (All Systems Ready)")
+    emit_status("LOG", "Core Online (Settings & Diagnostic Search Active)")
 
     try:
         while True:
